@@ -31,6 +31,7 @@
 /// And the Use-case-2 would require a modified version of the Decider circuits.
 ///
 use ark_ff::PrimeField;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{One, Zero};
 
 use crate::{
@@ -52,6 +53,7 @@ use super::{
     CommittedInstance, Nova, Witness,
 };
 
+#[derive(CanonicalSerialize, CanonicalDeserialize)]
 pub struct RandomizedIVCProof<C1: CurveGroup, C2: CurveGroup> {
     pub U_i: CommittedInstance<C1>,
     pub u_i: CommittedInstance<C1>,
