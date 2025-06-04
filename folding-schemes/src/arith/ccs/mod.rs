@@ -6,8 +6,8 @@ use crate::utils::vec::{
 };
 use crate::Error;
 
-use super::{r1cs::R1CS, ArithRelation};
-use super::{Arith, ArithSerializer};
+use super::ArithSerializer;
+use super::{r1cs::R1CS, Arith};
 
 pub mod circuits;
 
@@ -16,19 +16,21 @@ pub mod circuits;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CCS<F: PrimeField> {
     /// m: number of rows in M_i (such that M_i \in F^{m, n})
-    m: usize,
+    pub m: usize,
     /// n = |z|, number of cols in M_i
-    n: usize,
+    pub n: usize,
     /// l = |io|, size of public input/output
-    l: usize,
+    pub l: usize,
     /// t = |M|, number of matrices
     pub t: usize,
     /// q = |c| = |S|, number of multisets
-    q: usize,
+    pub q: usize,
     /// d: max degree in each variable
-    d: usize,
+    pub d: usize,
     /// s = log(m), dimension of x
     pub s: usize,
+    /// s_prime = log(n), dimension of y
+    pub s_prime: usize,
 
     /// vector of matrices
     pub M: Vec<SparseMatrix<F>>,
@@ -62,40 +64,14 @@ impl<F: PrimeField> CCS<F> {
 
         Ok(result)
     }
-}
 
-impl<F: PrimeField> Arith for CCS<F> {
-    #[inline]
-    fn degree(&self) -> usize {
-        self.d
-    }
-
-    #[inline]
-    fn n_constraints(&self) -> usize {
-        self.m
-    }
-
-    #[inline]
-    fn n_variables(&self) -> usize {
-        self.n
-    }
-
-    #[inline]
-    fn n_public_inputs(&self) -> usize {
-        self.l
-    }
-
-    #[inline]
-    fn n_witnesses(&self) -> usize {
-        self.n_variables() - self.n_public_inputs() - 1
-    }
-
-    fn split_z<P: PrimeField>(&self, z: &[P]) -> (Vec<P>, Vec<P>) {
+    /// returns a tuple containing (w, x) (witness and public inputs respectively)
+    pub fn split_z(&self, z: &[F]) -> (Vec<F>, Vec<F>) {
         (z[self.l + 1..].to_vec(), z[1..self.l + 1].to_vec())
     }
 }
 
-impl<F: PrimeField, W: AsRef<[F]>, U: AsRef<[F]>> ArithRelation<W, U> for CCS<F> {
+impl<F: PrimeField, W: AsRef<[F]>, U: AsRef<[F]>> Arith<W, U> for CCS<F> {
     type Evaluation = Vec<F>;
 
     fn eval_relation(&self, w: &W, u: &U) -> Result<Self::Evaluation, Error> {
@@ -123,16 +99,17 @@ impl<F: PrimeField> ArithSerializer for CCS<F> {
 
 impl<F: PrimeField> From<R1CS<F>> for CCS<F> {
     fn from(r1cs: R1CS<F>) -> Self {
-        let m = r1cs.n_constraints();
-        let n = r1cs.n_variables();
+        let m = r1cs.num_constraints();
+        let n = r1cs.num_variables();
         CCS {
             m,
             n,
-            l: r1cs.n_public_inputs(),
+            l: r1cs.num_public_inputs(),
             s: log2(m) as usize,
+            s_prime: log2(n) as usize,
             t: 3,
             q: 2,
-            d: r1cs.degree(),
+            d: 2,
 
             S: vec![vec![0, 1], vec![2]],
             c: vec![F::one(), F::one().neg()],

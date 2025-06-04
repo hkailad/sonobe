@@ -1,9 +1,11 @@
 use ark_crypto_primitives::sponge::{
     poseidon::constraints::PoseidonSpongeVar, CryptographicSponge,
 };
+use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
 use ark_poly::Polynomial;
 use ark_r1cs_std::{
+    convert::ToConstraintFieldGadget,
     fields::{fp::FpVar, FieldVar},
     poly::{domain::Radix2DomainVar, evaluations::univariate::EvaluationsVar},
 };
@@ -13,8 +15,8 @@ use ark_std::log2;
 use crate::folding::traits::{CommittedInstanceOps, CommittedInstanceVarOps, Dummy, WitnessOps};
 use crate::transcript::{Transcript, TranscriptVar};
 use crate::utils::vec::poly_from_vec;
-use crate::{arith::ArithRelation, folding::circuits::CF1};
-use crate::{Curve, Error};
+use crate::Error;
+use crate::{arith::Arith, folding::circuits::CF1};
 
 pub mod off_chain;
 pub mod on_chain;
@@ -24,7 +26,11 @@ pub mod on_chain;
 pub struct KZGChallengesGadget {}
 
 impl KZGChallengesGadget {
-    pub fn get_challenges_native<C: Curve, T: Transcript<CF1<C>>, U: CommittedInstanceOps<C>>(
+    pub fn get_challenges_native<
+        C: CurveGroup,
+        T: Transcript<CF1<C>>,
+        U: CommittedInstanceOps<C>,
+    >(
         transcript: &mut T,
         U_i: &U,
     ) -> Vec<CF1<C>> {
@@ -37,7 +43,7 @@ impl KZGChallengesGadget {
     }
 
     pub fn get_challenges_gadget<
-        C: Curve,
+        C: CurveGroup,
         S: CryptographicSponge,
         T: TranscriptVar<CF1<C>, S>,
         U: CommittedInstanceVarOps<C>,
@@ -47,7 +53,7 @@ impl KZGChallengesGadget {
     ) -> Result<Vec<FpVar<CF1<C>>>, SynthesisError> {
         let mut challenges = vec![];
         for cm in U_i.get_commitments() {
-            transcript.absorb_nonnative(&cm)?;
+            transcript.absorb(&cm.to_constraint_field()?)?;
             challenges.push(transcript.get_challenge()?);
         }
         Ok(challenges)
@@ -95,11 +101,11 @@ impl EvalGadget {
 /// In the future, we may introduce a better solution that uses a trait for all
 /// folding schemes that specifies their native and in-circuit behaviors.
 pub trait DeciderEnabledNIFS<
-    C: Curve,
+    C: CurveGroup,
     RU: CommittedInstanceOps<C>, // Running instance
     IU: CommittedInstanceOps<C>, // Incoming instance
     W: WitnessOps<CF1<C>>,
-    A: ArithRelation<W, RU>,
+    A: Arith<W, RU>,
 >
 {
     type ProofDummyCfg;

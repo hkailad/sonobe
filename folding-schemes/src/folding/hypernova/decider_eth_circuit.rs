@@ -3,14 +3,16 @@
 use ark_crypto_primitives::sponge::{
     constraints::CryptographicSpongeVar,
     poseidon::{constraints::PoseidonSpongeVar, PoseidonSponge},
-    CryptographicSponge,
+    Absorb, CryptographicSponge,
 };
+use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
 use ark_r1cs_std::{
     alloc::{AllocVar, AllocationMode},
     boolean::Boolean,
     eq::EqGadget,
     fields::fp::FpVar,
+    prelude::CurveVar,
 };
 use ark_relations::r1cs::{Namespace, SynthesisError};
 use ark_std::{borrow::Borrow, log2, marker::PhantomData};
@@ -20,7 +22,7 @@ use super::{
     nimfs::{NIMFSProof, NIMFS},
     HyperNova, Witness, CCCS, LCCCS,
 };
-use crate::folding::circuits::{decider::on_chain::GenericOnchainDeciderCircuit, CF1};
+use crate::folding::circuits::{decider::on_chain::GenericOnchainDeciderCircuit, CF1, CF2};
 use crate::folding::traits::{WitnessOps, WitnessVarOps};
 use crate::frontend::FCircuit;
 use crate::utils::gadgets::{eval_mle, MatrixGadget};
@@ -28,17 +30,16 @@ use crate::Error;
 use crate::{
     arith::{
         ccs::{circuits::CCSMatricesVar, CCS},
-        ArithRelationGadget,
+        ArithGadget,
     },
     folding::circuits::decider::{EvalGadget, KZGChallengesGadget},
 };
 use crate::{
     commitment::{pedersen::Params as PedersenParams, CommitmentScheme},
     folding::circuits::decider::DeciderEnabledNIFS,
-    Curve,
 };
 
-impl<C: Curve> ArithRelationGadget<WitnessVar<CF1<C>>, LCCCSVar<C>> for CCSMatricesVar<CF1<C>> {
+impl<C: CurveGroup> ArithGadget<WitnessVar<CF1<C>>, LCCCSVar<C>> for CCSMatricesVar<CF1<C>> {
     type Evaluation = Vec<FpVar<CF1<C>>>;
 
     fn eval_relation(
@@ -98,9 +99,10 @@ impl<F: PrimeField> WitnessVarOps<F> for WitnessVar<F> {
     }
 }
 
-pub type DeciderEthCircuit<C1, C2> = GenericOnchainDeciderCircuit<
+pub type DeciderEthCircuit<C1, C2, GC2> = GenericOnchainDeciderCircuit<
     C1,
     C2,
+    GC2,
     LCCCS<C1>,
     CCCS<C1>,
     Witness<CF1<C1>>,
@@ -110,8 +112,10 @@ pub type DeciderEthCircuit<C1, C2> = GenericOnchainDeciderCircuit<
 >;
 
 impl<
-        C1: Curve,
-        C2: Curve,
+        C1: CurveGroup,
+        GC1: CurveVar<C1, CF2<C1>>,
+        C2: CurveGroup,
+        GC2: CurveVar<C2, CF2<C2>>,
         FC: FCircuit<C1::ScalarField>,
         CS1: CommitmentScheme<C1, H>,
         // enforce that the CS2 is Pedersen commitment scheme, since we're at Ethereum's EVM decider
@@ -119,11 +123,14 @@ impl<
         const MU: usize,
         const NU: usize,
         const H: bool,
-    > TryFrom<HyperNova<C1, C2, FC, CS1, CS2, MU, NU, H>> for DeciderEthCircuit<C1, C2>
+    > TryFrom<HyperNova<C1, GC1, C2, GC2, FC, CS1, CS2, MU, NU, H>>
+    for DeciderEthCircuit<C1, C2, GC2>
+where
+    CF1<C1>: Absorb,
 {
     type Error = Error;
 
-    fn try_from(hn: HyperNova<C1, C2, FC, CS1, CS2, MU, NU, H>) -> Result<Self, Error> {
+    fn try_from(hn: HyperNova<C1, GC1, C2, GC2, FC, CS1, CS2, MU, NU, H>) -> Result<Self, Error> {
         // compute the U_{i+1}, W_{i+1}, by folding the last running & incoming instances
         let mut transcript = PoseidonSponge::<C1::ScalarField>::new(&hn.poseidon_config);
         transcript.absorb(&hn.pp_hash);
@@ -148,6 +155,7 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
+            _gc2: PhantomData,
             _avar: PhantomData,
             arith: hn.ccs,
             cf_arith: hn.cf_r1cs,
@@ -175,8 +183,10 @@ impl<
 
 pub struct DeciderHyperNovaGadget;
 
-impl<C: Curve> DeciderEnabledNIFS<C, LCCCS<C>, CCCS<C>, Witness<C::ScalarField>, CCS<CF1<C>>>
+impl<C: CurveGroup> DeciderEnabledNIFS<C, LCCCS<C>, CCCS<C>, Witness<C::ScalarField>, CCS<CF1<C>>>
     for DeciderHyperNovaGadget
+where
+    CF1<C>: Absorb,
 {
     type ProofDummyCfg = (usize, usize, usize, usize);
     type Proof = NIMFSProof<C>;
@@ -225,13 +235,13 @@ impl<C: Curve> DeciderEnabledNIFS<C, LCCCS<C>, CCCS<C>, Witness<C::ScalarField>,
 
 #[cfg(test)]
 pub mod tests {
-    use ark_bn254::{Fr, G1Projective as Projective};
-    use ark_grumpkin::Projective as Projective2;
+    use ark_bn254::{constraints::GVar, Fr, G1Projective as Projective};
+    use ark_grumpkin::{constraints::GVar as GVar2, Projective as Projective2};
     use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
     use ark_std::{test_rng, UniformRand};
 
     use super::*;
-    use crate::arith::{r1cs::R1CS, Arith};
+    use crate::arith::r1cs::R1CS;
     use crate::commitment::pedersen::Pedersen;
     use crate::folding::nova::PreprocessorParam;
     use crate::frontend::utils::CubicFCircuit;
@@ -247,7 +257,7 @@ pub mod tests {
         let ccs = CCS::from(r1cs);
         let z: Vec<Fr> = (0..n_cols).map(|_| Fr::rand(&mut rng)).collect();
 
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         let (lcccs, w) = ccs.to_lcccs::<_, Projective, Pedersen<Projective>, false>(
             &mut rng,
@@ -281,7 +291,9 @@ pub mod tests {
 
         type HN = HyperNova<
             Projective,
+            GVar,
             Projective2,
+            GVar2,
             CubicFCircuit<Fr>,
             Pedersen<Projective>,
             Pedersen<Projective2>,
@@ -301,13 +313,14 @@ pub mod tests {
 
         // generate a Nova instance and do a step of it
         let mut hypernova = HN::init(&hn_params, F_circuit, z_0.clone())?;
-        hypernova.prove_step(&mut rng, (), None)?;
+        hypernova.prove_step(&mut rng, vec![], None)?;
 
         let ivc_proof = hypernova.ivc_proof();
         HN::verify(hn_params.1, ivc_proof)?;
 
         // load the DeciderEthCircuit from the generated Nova instance
-        let decider_circuit = DeciderEthCircuit::<Projective, Projective2>::try_from(hypernova)?;
+        let decider_circuit =
+            DeciderEthCircuit::<Projective, Projective2, GVar2>::try_from(hypernova)?;
 
         let cs = ConstraintSystem::<Fr>::new_ref();
 

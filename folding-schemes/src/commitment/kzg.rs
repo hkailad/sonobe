@@ -24,17 +24,17 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use super::CommitmentScheme;
 use crate::transcript::Transcript;
 use crate::utils::vec::poly_from_vec;
-use crate::{Curve, Error};
+use crate::Error;
 
 /// ProverKey defines a similar struct as in ark_poly_commit::kzg10::Powers, but instead of
-/// depending on the Pairing trait it depends on the SonobeCurve trait.
+/// depending on the Pairing trait it depends on the CurveGroup trait.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct ProverKey<'a, C: Curve> {
+pub struct ProverKey<'a, C: CurveGroup> {
     /// Group elements of the form `β^i G`, for different values of `i`.
     pub powers_of_g: Cow<'a, [C::Affine]>,
 }
 
-impl<'a, C: Curve> CanonicalSerialize for ProverKey<'a, C> {
+impl<'a, C: CurveGroup> CanonicalSerialize for ProverKey<'a, C> {
     fn serialize_with_mode<W: std::io::prelude::Write>(
         &self,
         mut writer: W,
@@ -48,7 +48,7 @@ impl<'a, C: Curve> CanonicalSerialize for ProverKey<'a, C> {
     }
 }
 
-impl<'a, C: Curve> CanonicalDeserialize for ProverKey<'a, C> {
+impl<'a, C: CurveGroup> CanonicalDeserialize for ProverKey<'a, C> {
     fn deserialize_with_mode<R: std::io::prelude::Read>(
         reader: R,
         compress: ark_serialize::Compress,
@@ -61,7 +61,7 @@ impl<'a, C: Curve> CanonicalDeserialize for ProverKey<'a, C> {
     }
 }
 
-impl<'a, C: Curve> Valid for ProverKey<'a, C> {
+impl<'a, C: CurveGroup> Valid for ProverKey<'a, C> {
     fn check(&self) -> Result<(), ark_serialize::SerializationError> {
         match self.powers_of_g.clone() {
             Cow::Borrowed(powers) => powers.to_vec().check(),
@@ -71,7 +71,7 @@ impl<'a, C: Curve> Valid for ProverKey<'a, C> {
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
-pub struct Proof<C: Curve> {
+pub struct Proof<C: CurveGroup> {
     pub eval: C::ScalarField,
     pub proof: C,
 }
@@ -83,7 +83,10 @@ pub struct KZG<'a, E: Pairing, const H: bool = false> {
     _e: PhantomData<E>,
 }
 
-impl<'a, E: Pairing<G1: Curve>, const H: bool> CommitmentScheme<E::G1, H> for KZG<'a, E, H> {
+impl<'a, E, const H: bool> CommitmentScheme<E::G1, H> for KZG<'a, E, H>
+where
+    E: Pairing,
+{
     type ProverParams = ProverKey<'a, E::G1>;
     type VerifierParams = VerifierKey<E>;
     type Proof = Proof<E::G1>;
@@ -98,7 +101,7 @@ impl<'a, E: Pairing<G1: Curve>, const H: bool> CommitmentScheme<E::G1, H> for KZ
     }
 
     /// setup returns the tuple (ProverKey, VerifierKey). For real world deployments the setup must
-    /// be computed in the most trustless way possible, usually through an MPC ceremony.
+    /// be computed in the most trustless way possible, usually through a MPC ceremony.
     fn setup(
         mut rng: impl RngCore,
         len: usize,

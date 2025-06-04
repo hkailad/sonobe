@@ -1,4 +1,3 @@
-pub mod calldata;
 pub mod evm;
 pub mod utils;
 pub mod verifiers;

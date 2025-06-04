@@ -2,31 +2,36 @@
 /// the Decider from decider.rs file will be more efficient.
 /// More details can be found at the documentation page:
 /// https://privacy-scaling-explorations.github.io/sonobe-docs/design/nova-decider-onchain.html
+use ark_bn254::Bn254;
+use ark_crypto_primitives::sponge::Absorb;
+use ark_ec::{AffineRepr, CurveGroup};
+use ark_ff::{BigInteger, PrimeField};
+use ark_groth16::Groth16;
+use ark_r1cs_std::prelude::CurveVar;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
-use ark_std::{
-    rand::{CryptoRng, RngCore},
-    One, Zero,
-};
+use ark_std::rand::{CryptoRng, RngCore};
+use ark_std::{One, Zero};
 use core::marker::PhantomData;
 
 pub use super::decider_eth_circuit::DeciderEthCircuit;
 use super::decider_eth_circuit::DeciderNovaGadget;
-use super::Nova;
-use crate::folding::circuits::decider::DeciderEnabledNIFS;
-use crate::folding::traits::{InputizeNonNative, WitnessOps};
-use crate::frontend::FCircuit;
-use crate::{
-    commitment::{kzg::Proof as KZGProof, pedersen::Params as PedersenParams, CommitmentScheme},
-    folding::traits::Dummy,
+use super::{CommittedInstance, Nova};
+use crate::commitment::{
+    kzg::{Proof as KZGProof, KZG},
+    pedersen::Params as PedersenParams,
+    CommitmentScheme,
 };
-use crate::{Curve, Error};
+use crate::folding::circuits::{decider::DeciderEnabledNIFS, CF2};
+use crate::folding::traits::{Inputize, WitnessOps};
+use crate::frontend::FCircuit;
+use crate::Error;
 use crate::{Decider as DeciderTrait, FoldingScheme};
 
 #[derive(Debug, Clone, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Proof<C, CS, S>
 where
-    C: Curve,
+    C: CurveGroup,
     CS: CommitmentScheme<C, ProverChallenge = C::ScalarField, Challenge = C::ScalarField>,
     S: SNARK<C::ScalarField>,
 {
@@ -37,41 +42,14 @@ where
     cmT: C,
     r: C::ScalarField,
     // the KZG challenges are provided by the prover, but in-circuit they are checked to match
-    // the in-circuit computed ones.
+    // the in-circuit computed computed ones.
     kzg_challenges: [C::ScalarField; 2],
-}
-
-impl<C, CS, S> Proof<C, CS, S>
-where
-    C: Curve,
-    CS: CommitmentScheme<C, ProverChallenge = C::ScalarField, Challenge = C::ScalarField>,
-    S: SNARK<C::ScalarField>,
-{
-    pub fn snark_proof(&self) -> &S::Proof {
-        &self.snark_proof
-    }
-
-    pub fn kzg_proofs(&self) -> &[CS::Proof; 2] {
-        &self.kzg_proofs
-    }
-
-    pub fn cmT(&self) -> &C {
-        &self.cmT
-    }
-
-    pub fn r(&self) -> C::ScalarField {
-        self.r
-    }
-
-    pub fn kzg_challenges(&self) -> [C::ScalarField; 2] {
-        self.kzg_challenges
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct VerifierParam<C1, CS_VerifyingKey, S_VerifyingKey>
 where
-    C1: Curve,
+    C1: CurveGroup,
     CS_VerifyingKey: Clone + CanonicalSerialize + CanonicalDeserialize,
     S_VerifyingKey: Clone + CanonicalSerialize + CanonicalDeserialize,
 {
@@ -82,9 +60,11 @@ where
 
 /// Onchain Decider, for ethereum use cases
 #[derive(Clone, Debug)]
-pub struct Decider<C1, C2, FC, CS1, CS2, S, FS> {
+pub struct Decider<C1, GC1, C2, GC2, FC, CS1, CS2, S, FS> {
     _c1: PhantomData<C1>,
+    _gc1: PhantomData<GC1>,
     _c2: PhantomData<C2>,
+    _gc2: PhantomData<GC2>,
     _fc: PhantomData<FC>,
     _cs1: PhantomData<CS1>,
     _cs2: PhantomData<CS2>,
@@ -92,11 +72,13 @@ pub struct Decider<C1, C2, FC, CS1, CS2, S, FS> {
     _fs: PhantomData<FS>,
 }
 
-impl<C1, C2, FC, CS1, CS2, S, FS> DeciderTrait<C1, C2, FC, FS>
-    for Decider<C1, C2, FC, CS1, CS2, S, FS>
+impl<C1, GC1, C2, GC2, FC, CS1, CS2, S, FS> DeciderTrait<C1, C2, FC, FS>
+    for Decider<C1, GC1, C2, GC2, FC, CS1, CS2, S, FS>
 where
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF2<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
     FC: FCircuit<C1::ScalarField>,
     // CS1 is a KZG commitment, where challenge is C1::Fr elem
     CS1: CommitmentScheme<
@@ -109,14 +91,19 @@ where
     CS2: CommitmentScheme<C2, ProverParams = PedersenParams<C2>>,
     S: SNARK<C1::ScalarField>,
     FS: FoldingScheme<C1, C2, FC>,
+    <C1 as CurveGroup>::BaseField: PrimeField,
+    <C2 as CurveGroup>::BaseField: PrimeField,
+    C1::ScalarField: Absorb,
+    C2::ScalarField: Absorb,
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
     // constrain FS into Nova, since this is a Decider specifically for Nova
-    Nova<C1, C2, FC, CS1, CS2, false>: From<FS>,
+    Nova<C1, GC1, C2, GC2, FC, CS1, CS2, false>: From<FS>,
     crate::folding::nova::ProverParams<C1, C2, CS1, CS2, false>:
         From<<FS as FoldingScheme<C1, C2, FC>>::ProverParam>,
     crate::folding::nova::VerifierParams<C1, C2, CS1, CS2, false>:
         From<<FS as FoldingScheme<C1, C2, FC>>::VerifierParam>,
 {
-    type PreprocessorParam = ((FS::ProverParam, FS::VerifierParam), usize);
+    type PreprocessorParam = (FS::ProverParam, FS::VerifierParam);
     type ProverParam = (S::ProvingKey, CS1::ProverParams);
     type Proof = Proof<C1, CS1, S>;
     type VerifierParam = VerifierParam<C1, CS1::VerifierParams, S::VerifyingKey>;
@@ -125,33 +112,29 @@ where
 
     fn preprocess(
         mut rng: impl RngCore + CryptoRng,
-        ((pp, vp), state_len): Self::PreprocessorParam,
+        prep_param: Self::PreprocessorParam,
+        fs: FS,
     ) -> Result<(Self::ProverParam, Self::VerifierParam), Error> {
-        // get the FoldingScheme prover & verifier params from Nova
-        let nova_pp: <Nova<C1, C2, FC, CS1, CS2, false> as FoldingScheme<C1, C2, FC>>::ProverParam =
-            pp.into();
-        let nova_vp: <Nova<C1, C2, FC, CS1, CS2, false> as FoldingScheme<
-                    C1,
-                    C2,
-                    FC,
-                >>::VerifierParam = vp.into();
-
-        let pp_hash = nova_vp.pp_hash()?;
-
-        let circuit = DeciderEthCircuit::<C1, C2>::dummy((
-            nova_vp.r1cs,
-            nova_vp.cf_r1cs,
-            nova_pp.cf_cs_pp,
-            nova_pp.poseidon_config,
-            (),
-            (),
-            state_len,
-            2, // Nova's running CommittedInstance contains 2 commitments
-        ));
+        let circuit = DeciderEthCircuit::<C1, C2, GC2>::try_from(Nova::from(fs))?;
 
         // get the Groth16 specific setup for the circuit
         let (g16_pk, g16_vk) = S::circuit_specific_setup(circuit, &mut rng)
             .map_err(|e| Error::SNARKSetupFail(e.to_string()))?;
+
+        // get the FoldingScheme prover & verifier params from Nova
+        #[allow(clippy::type_complexity)]
+        let nova_pp: <Nova<C1, GC1, C2, GC2, FC, CS1, CS2, false> as FoldingScheme<
+            C1,
+            C2,
+            FC,
+        >>::ProverParam = prep_param.0.clone().into();
+        #[allow(clippy::type_complexity)]
+        let nova_vp: <Nova<C1, GC1, C2, GC2, FC, CS1, CS2, false> as FoldingScheme<
+            C1,
+            C2,
+            FC,
+        >>::VerifierParam = prep_param.1.clone().into();
+        let pp_hash = nova_vp.pp_hash()?;
 
         let pp = (g16_pk, nova_pp.cs_pp);
         let vp = Self::VerifierParam {
@@ -169,7 +152,7 @@ where
     ) -> Result<Self::Proof, Error> {
         let (snark_pk, cs_pk): (S::ProvingKey, CS1::ProverParams) = pp;
 
-        let circuit = DeciderEthCircuit::<C1, C2>::try_from(Nova::from(folding_scheme))?;
+        let circuit = DeciderEthCircuit::<C1, C2, GC2>::try_from(Nova::from(folding_scheme))?;
 
         let cmT = circuit.proof;
         let r = circuit.randomness;
@@ -237,10 +220,13 @@ where
             &[pp_hash, i][..],
             &z_0,
             &z_i,
-            &U_final_commitments.inputize_nonnative(),
+            &U_final_commitments
+                .iter()
+                .flat_map(|c| c.inputize())
+                .collect::<Vec<_>>(),
             &proof.kzg_challenges,
             &proof.kzg_proofs.iter().map(|p| p.eval).collect::<Vec<_>>(),
-            &proof.cmT.inputize_nonnative(),
+            &proof.cmT.inputize(),
         ]
         .concat();
 
@@ -264,26 +250,86 @@ where
     }
 }
 
+/// Prepares solidity calldata for calling the NovaDecider contract
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_calldata(
+    function_signature_check: [u8; 4],
+    i: ark_bn254::Fr,
+    z_0: Vec<ark_bn254::Fr>,
+    z_i: Vec<ark_bn254::Fr>,
+    running_instance: &CommittedInstance<ark_bn254::G1Projective>,
+    incoming_instance: &CommittedInstance<ark_bn254::G1Projective>,
+    proof: Proof<ark_bn254::G1Projective, KZG<'static, Bn254>, Groth16<Bn254>>,
+) -> Result<Vec<u8>, Error> {
+    Ok(vec![
+        function_signature_check.to_vec(),
+        i.into_bigint().to_bytes_be(), // i
+        z_0.iter()
+            .flat_map(|v| v.into_bigint().to_bytes_be())
+            .collect::<Vec<u8>>(), // z_0
+        z_i.iter()
+            .flat_map(|v| v.into_bigint().to_bytes_be())
+            .collect::<Vec<u8>>(), // z_i
+        point_to_eth_format(running_instance.cmW.into_affine())?,
+        point_to_eth_format(running_instance.cmE.into_affine())?,
+        point_to_eth_format(incoming_instance.cmW.into_affine())?,
+        point_to_eth_format(proof.cmT.into_affine())?, // cmT
+        proof.r.into_bigint().to_bytes_be(),           // r
+        point_to_eth_format(proof.snark_proof.a)?,     // pA
+        point2_to_eth_format(proof.snark_proof.b)?,    // pB
+        point_to_eth_format(proof.snark_proof.c)?,     // pC
+        proof.kzg_challenges[0].into_bigint().to_bytes_be(), // challenge_W
+        proof.kzg_challenges[1].into_bigint().to_bytes_be(), // challenge_E
+        proof.kzg_proofs[0].eval.into_bigint().to_bytes_be(), // eval W
+        proof.kzg_proofs[1].eval.into_bigint().to_bytes_be(), // eval E
+        point_to_eth_format(proof.kzg_proofs[0].proof.into_affine())?, // W kzg_proof
+        point_to_eth_format(proof.kzg_proofs[1].proof.into_affine())?, // E kzg_proof
+    ]
+    .concat())
+}
+
+fn point_to_eth_format<C: AffineRepr>(p: C) -> Result<Vec<u8>, Error>
+where
+    C::BaseField: PrimeField,
+{
+    // the encoding of the additive identity is [0, 0] on the EVM
+    let (x, y) = p.xy().unwrap_or_default();
+
+    Ok([x.into_bigint().to_bytes_be(), y.into_bigint().to_bytes_be()].concat())
+}
+fn point2_to_eth_format(p: ark_bn254::G2Affine) -> Result<Vec<u8>, Error> {
+    let (x, y) = p.xy().unwrap_or_default();
+
+    Ok([
+        x.c1.into_bigint().to_bytes_be(),
+        x.c0.into_bigint().to_bytes_be(),
+        y.c1.into_bigint().to_bytes_be(),
+        y.c0.into_bigint().to_bytes_be(),
+    ]
+    .concat())
+}
+
 #[cfg(test)]
 pub mod tests {
+    use ark_bn254::{constraints::GVar, Fr, G1Projective as Projective};
+    use ark_grumpkin::{constraints::GVar as GVar2, Projective as Projective2};
+    use std::time::Instant;
+
     use super::*;
-    use crate::commitment::kzg::KZG;
     use crate::commitment::pedersen::Pedersen;
     use crate::folding::nova::{PreprocessorParam, ProverParams as NovaProverParams};
     use crate::folding::traits::CommittedInstanceOps;
     use crate::frontend::utils::CubicFCircuit;
     use crate::transcript::poseidon::poseidon_canonical_config;
-    use ark_bn254::{Bn254, Fr, G1Projective as Projective};
-    use ark_groth16::Groth16;
-    use ark_grumpkin::Projective as Projective2;
-    use std::time::Instant;
 
     #[test]
     fn test_decider() -> Result<(), Error> {
         // use Nova as FoldingScheme
         type N = Nova<
             Projective,
+            GVar,
             Projective2,
+            GVar2,
             CubicFCircuit<Fr>,
             KZG<'static, Bn254>,
             Pedersen<Projective2>,
@@ -291,7 +337,9 @@ pub mod tests {
         >;
         type D = Decider<
             Projective,
+            GVar,
             Projective2,
+            GVar2,
             CubicFCircuit<Fr>,
             KZG<'static, Bn254>,
             Pedersen<Projective2>,
@@ -313,13 +361,12 @@ pub mod tests {
         println!("Nova initialized, {:?}", start.elapsed());
 
         // prepare the Decider prover & verifier params
-        let (decider_pp, decider_vp) =
-            D::preprocess(&mut rng, (nova_params, F_circuit.state_len()))?;
+        let (decider_pp, decider_vp) = D::preprocess(&mut rng, nova_params, nova.clone())?;
 
         let start = Instant::now();
-        nova.prove_step(&mut rng, (), None)?;
+        nova.prove_step(&mut rng, vec![], None)?;
         println!("prove_step, {:?}", start.elapsed());
-        nova.prove_step(&mut rng, (), None)?; // do a 2nd step
+        nova.prove_step(&mut rng, vec![], None)?; // do a 2nd step
 
         // decider proof generation
         let start = Instant::now();
@@ -362,7 +409,9 @@ pub mod tests {
         // use Nova as FoldingScheme
         type N = Nova<
             Projective,
+            GVar,
             Projective2,
+            GVar2,
             CubicFCircuit<Fr>,
             KZG<'static, Bn254>,
             Pedersen<Projective2>,
@@ -370,7 +419,9 @@ pub mod tests {
         >;
         type D = Decider<
             Projective,
+            GVar,
             Projective2,
+            GVar2,
             CubicFCircuit<Fr>,
             KZG<'static, Bn254>,
             Pedersen<Projective2>,
@@ -387,9 +438,12 @@ pub mod tests {
         let preprocessor_param = PreprocessorParam::new(poseidon_config, F_circuit);
         let nova_params = N::preprocess(&mut rng, &preprocessor_param)?;
 
+        let start = Instant::now();
+        let nova = N::init(&nova_params, F_circuit, z_0.clone())?;
+        println!("Nova initialized, {:?}", start.elapsed());
+
         // prepare the Decider prover & verifier params
-        let (decider_pp, decider_vp) =
-            D::preprocess(&mut rng, (nova_params.clone(), F_circuit.state_len()))?;
+        let (decider_pp, decider_vp) = D::preprocess(&mut rng, nova_params.clone(), nova.clone())?;
 
         // serialize the Nova params. These params are the trusted setup of the commitment schemes used
         // (ie. KZG & Pedersen in this case)
@@ -426,9 +480,9 @@ pub mod tests {
         let mut nova = N::init(&nova_params, F_circuit, z_0)?;
 
         let start = Instant::now();
-        nova.prove_step(&mut rng, (), None)?;
+        nova.prove_step(&mut rng, vec![], None)?;
         println!("prove_step, {:?}", start.elapsed());
-        nova.prove_step(&mut rng, (), None)?; // do a 2nd step
+        nova.prove_step(&mut rng, vec![], None)?; // do a 2nd step
 
         // decider proof generation
         let start = Instant::now();

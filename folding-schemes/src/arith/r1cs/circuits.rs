@@ -1,5 +1,5 @@
 use crate::{
-    arith::ArithRelationGadget,
+    arith::ArithGadget,
     utils::gadgets::{EquivalenceGadget, MatrixGadget, SparseMatrixVar, VectorGadget},
 };
 use ark_ff::PrimeField;
@@ -59,7 +59,7 @@ where
     }
 }
 
-impl<M, FVar, WVar: AsRef<[FVar]>, UVar: AsRef<[FVar]>> ArithRelationGadget<WVar, UVar>
+impl<M, FVar, WVar: AsRef<[FVar]>, UVar: AsRef<[FVar]>> ArithGadget<WVar, UVar>
     for R1CSMatricesVar<M, FVar>
 where
     SparseMatrixVar<FVar>: MatrixGadget<FVar>,
@@ -86,6 +86,8 @@ where
 
 #[cfg(test)]
 pub mod tests {
+    use std::cmp::max;
+
     use ark_crypto_primitives::crh::{
         sha256::{
             constraints::{Sha256Gadget, UnitVar},
@@ -93,17 +95,16 @@ pub mod tests {
         },
         CRHScheme, CRHSchemeGadget,
     };
-
+    use ark_ec::CurveGroup;
     use ark_ff::BigInteger;
     use ark_pallas::{Fq, Fr, Projective};
     use ark_r1cs_std::{eq::EqGadget, fields::fp::FpVar, uint8::UInt8};
     use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef};
     use ark_std::{
-        cmp::max,
         rand::{thread_rng, Rng},
         One, UniformRand,
     };
-    use ark_vesta::Projective as Projective2;
+    use ark_vesta::{constraints::GVar as GVar2, Projective as Projective2};
 
     use super::*;
     use crate::arith::{
@@ -111,7 +112,7 @@ pub mod tests {
             extract_r1cs, extract_w_x,
             tests::{get_test_r1cs, get_test_z},
         },
-        Arith, ArithRelation,
+        Arith,
     };
     use crate::commitment::{pedersen::Pedersen, CommitmentScheme};
     use crate::folding::{
@@ -125,14 +126,12 @@ pub mod tests {
         },
     };
     use crate::frontend::{
-        utils::{
-            cubic_step_native, custom_step_native, CubicFCircuit, CustomFCircuit, WrapperCircuit,
-        },
+        utils::{CubicFCircuit, CustomFCircuit, WrapperCircuit},
         FCircuit,
     };
-    use crate::{Curve, Error};
+    use crate::Error;
 
-    fn prepare_instances<C: Curve, CS: CommitmentScheme<C>, R: Rng>(
+    fn prepare_instances<C: CurveGroup, CS: CommitmentScheme<C>, R: Rng>(
         mut rng: R,
         r1cs: &R1CS<C::ScalarField>,
         z: &[C::ScalarField],
@@ -210,7 +209,7 @@ pub mod tests {
         let circuit = WrapperCircuit::<Fr, CubicFCircuit<Fr>> {
             FC: cubic_circuit,
             z_i: Some(z_i.clone()),
-            z_i1: Some(cubic_step_native(z_i)),
+            z_i1: Some(cubic_circuit.step_native(0, z_i, vec![])?),
         };
 
         test_relaxed_r1cs_gadget(circuit)
@@ -254,26 +253,25 @@ pub mod tests {
         let circuit = WrapperCircuit::<Fr, CustomFCircuit<Fr>> {
             FC: custom_circuit,
             z_i: Some(z_i.clone()),
-            z_i1: Some(custom_step_native(z_i, n_constraints)),
+            z_i1: Some(custom_circuit.step_native(0, z_i, vec![])?),
         };
         test_relaxed_r1cs_gadget(circuit)
     }
 
     #[test]
     fn test_relaxed_r1cs_nonnative_circuit() -> Result<(), Error> {
-        let n_constraints = 10;
         let rng = &mut thread_rng();
 
         let cs = ConstraintSystem::<Fq>::new_ref();
         // in practice we would use CycleFoldCircuit, but is a very big circuit (when computed
         // non-natively inside the RelaxedR1CS circuit), so in order to have a short test we use a
         // custom circuit.
-        let custom_circuit = CustomFCircuit::<Fq>::new(n_constraints)?;
+        let custom_circuit = CustomFCircuit::<Fq>::new(10)?;
         let z_i = vec![Fq::from(5_u32)];
         let circuit = WrapperCircuit::<Fq, CustomFCircuit<Fq>> {
             FC: custom_circuit,
             z_i: Some(z_i.clone()),
-            z_i1: Some(custom_step_native(z_i, n_constraints)),
+            z_i1: Some(custom_circuit.step_native(0, z_i, vec![])?),
         };
         circuit.generate_constraints(cs.clone())?;
         cs.finalize();
@@ -294,7 +292,7 @@ pub mod tests {
         // non-natively
         let cs = ConstraintSystem::<Fr>::new_ref();
         let wVar = CycleFoldWitnessVar::new_witness(cs.clone(), || Ok(w))?;
-        let uVar = CycleFoldCommittedInstanceVar::new_witness(cs.clone(), || Ok(u))?;
+        let uVar = CycleFoldCommittedInstanceVar::<_, GVar2>::new_witness(cs.clone(), || Ok(u))?;
         let r1csVar =
             R1CSMatricesVar::<Fq, NonNativeUintVar<Fr>>::new_witness(cs.clone(), || Ok(r1cs))?;
         r1csVar.enforce_relation(&wVar, &uVar)?;

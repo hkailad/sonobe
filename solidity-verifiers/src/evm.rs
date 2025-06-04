@@ -1,10 +1,10 @@
 pub use revm;
 use revm::{
-    primitives::{hex, Address, ExecutionResult, Output, TransactTo, TxEnv},
-    Evm as EVM, EvmBuilder, InMemoryDB,
+    primitives::{hex, Address, CreateScheme, ExecutionResult, Output, TransactTo, TxEnv},
+    InMemoryDB, EVM,
 };
 use std::{
-    fmt::Debug,
+    fmt::{self, Debug, Formatter},
     fs::{self, create_dir_all, File},
     io::{self, Write},
     path::PathBuf,
@@ -71,31 +71,39 @@ pub fn compile_solidity(solidity: impl AsRef<[u8]>, contract_name: &str) -> Vec<
 /// `contract_name` is provided since `solc` may compile multiple contracts or libraries.
 /// hence, we need to find the correct binary.
 fn find_binary(stdout: &str, contract_name: &str) -> Option<Vec<u8>> {
-    let intro_str = format!("======= <stdin>:{contract_name} =======\nBinary:\n");
-    let start = stdout.find(&intro_str)?;
-    let end = stdout[start + intro_str.len()..]
-        .find('\n')
-        .map(|pos| pos + start + intro_str.len())
-        .unwrap_or(stdout.len());
-    let binary_section = stdout[start + intro_str.len()..end].trim();
-    Some(hex::decode(binary_section).unwrap())
+    let start_contract = stdout.find(contract_name)?;
+    let stdout_contract = &stdout[start_contract..];
+    let start = stdout_contract.find("Binary:")? + 8;
+    Some(hex::decode(&stdout_contract[start..stdout_contract.len() - 1]).unwrap())
 }
 
 /// Evm runner.
-#[derive(Debug)]
-pub struct Evm<'a> {
-    evm: EVM<'a, (), InMemoryDB>,
+pub struct Evm {
+    evm: EVM<InMemoryDB>,
 }
 
-impl<'a> Default for Evm<'a> {
+impl Debug for Evm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("Evm");
+        debug_struct
+            .field("env", &self.evm.env)
+            .field("db", &self.evm.db.as_ref().unwrap())
+            .finish()
+    }
+}
+
+impl Default for Evm {
     fn default() -> Self {
         Self {
-            evm: EvmBuilder::default().with_db(InMemoryDB::default()).build(),
+            evm: EVM {
+                env: Default::default(),
+                db: Some(Default::default()),
+            },
         }
     }
 }
 
-impl<'a> Evm<'a> {
+impl Evm {
     /// Apply create transaction with given `bytecode` as creation bytecode.
     /// Return created `address`.
     ///
@@ -104,7 +112,7 @@ impl<'a> Evm<'a> {
     pub fn create(&mut self, bytecode: Vec<u8>) -> Address {
         let (_, output) = self.transact_success_or_panic(TxEnv {
             gas_limit: u64::MAX,
-            transact_to: TransactTo::Create,
+            transact_to: TransactTo::Create(CreateScheme::Create),
             data: bytecode.into(),
             ..Default::default()
         });
@@ -133,8 +141,9 @@ impl<'a> Evm<'a> {
     }
 
     fn transact_success_or_panic(&mut self, tx: TxEnv) -> (u64, Output) {
-        *self.evm.tx_mut() = tx;
+        self.evm.env.tx = tx;
         let result = self.evm.transact_commit().unwrap();
+        self.evm.env.tx = Default::default();
         match result {
             ExecutionResult::Success {
                 gas_used,
@@ -146,7 +155,7 @@ impl<'a> Evm<'a> {
                     println!("--- logs from {} ---", logs[0].address);
                     for (log_idx, log) in logs.iter().enumerate() {
                         println!("log#{log_idx}");
-                        for (topic_idx, topic) in log.topics().iter().enumerate() {
+                        for (topic_idx, topic) in log.topics.iter().enumerate() {
                             println!("  topic{topic_idx}: {topic:?}");
                         }
                     }

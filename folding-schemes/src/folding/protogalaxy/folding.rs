@@ -1,4 +1,6 @@
 /// Implements the scheme described in [ProtoGalaxy](https://eprint.iacr.org/2023/1106.pdf)
+use ark_crypto_primitives::sponge::Absorb;
+use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
 use ark_poly::{
     univariate::{DensePolynomial, SparsePolynomial},
@@ -12,11 +14,11 @@ use super::utils::{all_powers, betas_star, exponential_powers, pow_i};
 use super::ProtoGalaxyError;
 use super::{CommittedInstance, Witness};
 
+use crate::arith::r1cs::R1CS;
+use crate::folding::traits::Dummy;
 use crate::transcript::Transcript;
 use crate::utils::vec::*;
 use crate::Error;
-use crate::{arith::r1cs::R1CS, Curve};
-use crate::{arith::Arith, folding::traits::Dummy};
 
 #[derive(Debug, Clone)]
 pub struct ProtoGalaxyProof<F: PrimeField> {
@@ -34,7 +36,7 @@ impl<F: PrimeField> Dummy<(usize, usize, usize)> for ProtoGalaxyProof<F> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProtoGalaxyAux<C: Curve> {
+pub struct ProtoGalaxyAux<C: CurveGroup> {
     pub L_X_evals: Vec<C::ScalarField>,
     pub phi_stars: Vec<C>,
 }
@@ -42,10 +44,13 @@ pub struct ProtoGalaxyAux<C: Curve> {
 #[derive(Clone, Debug)]
 /// Implements the protocol described in section 4 of
 /// [ProtoGalaxy](https://eprint.iacr.org/2023/1106.pdf)
-pub struct Folding<C: Curve> {
+pub struct Folding<C: CurveGroup> {
     _phantom: PhantomData<C>,
 }
-impl<C: Curve> Folding<C> {
+impl<C: CurveGroup> Folding<C>
+where
+    C::ScalarField: Absorb,
+{
     #![allow(clippy::type_complexity)]
     /// implements the non-interactive Prover from the folding scheme described in section 4
     pub fn prove(
@@ -74,11 +79,11 @@ impl<C: Curve> Folding<C> {
                 vec_w.len(),
             ));
         }
-        let d = r1cs.degree();
+        let d = 2; // for the moment hardcoded to 2 since it only supports R1CS
         let k = vec_instances.len();
         let t = instance.betas.len();
-        let n = r1cs.n_variables();
-        let m = r1cs.n_constraints();
+        let n = r1cs.A.n_cols;
+        let m = r1cs.A.n_rows;
 
         let z = [vec![C::ScalarField::one()], instance.x.clone(), w.w.clone()].concat();
 
@@ -140,7 +145,7 @@ impl<C: Curve> Folding<C> {
         // 'refreshed' randomness) satisfies the relation.
         #[cfg(test)]
         {
-            use crate::arith::ArithRelation;
+            use crate::arith::Arith;
             r1cs.check_relation(
                 w,
                 &CommittedInstance::<_, true> {
@@ -408,7 +413,7 @@ pub mod tests {
     use ark_std::{rand::Rng, UniformRand};
 
     use crate::arith::r1cs::tests::{get_test_r1cs, get_test_z_split};
-    use crate::arith::ArithRelation;
+    use crate::arith::Arith;
     use crate::commitment::{pedersen::Pedersen, CommitmentScheme};
     use crate::transcript::poseidon::poseidon_canonical_config;
 
@@ -429,7 +434,7 @@ pub mod tests {
 
     // k represents the number of instances to be fold, apart from the running instance
     #[allow(clippy::type_complexity)]
-    pub fn prepare_inputs<C: Curve>(
+    pub fn prepare_inputs<C: CurveGroup>(
         k: usize,
     ) -> Result<
         (
@@ -446,7 +451,7 @@ pub mod tests {
 
         let (pedersen_params, _) = Pedersen::<C>::setup(&mut rng, w.len())?;
 
-        let t = log2(get_test_r1cs::<C::ScalarField>().n_constraints()) as usize;
+        let t = log2(get_test_r1cs::<C::ScalarField>().A.n_rows) as usize;
 
         let beta = C::ScalarField::rand(&mut rng);
         let betas = exponential_powers(beta, t);

@@ -12,7 +12,7 @@ use crate::utils::vec::SparseMatrix;
 
 /// `EquivalenceGadget` enforces that two in-circuit variables are equivalent,
 /// where the equivalence relation is parameterized by `M`:
-/// - For `FpVar`, it is simply an equality relation, and `M` is unused.
+/// - For `FpVar`, it is simply a equality relation, and `M` is unused.
 /// - For `NonNativeUintVar`, we consider equivalence as a congruence relation,
 ///   in terms of modular arithmetic, so `M` specifies the modulus.
 pub trait EquivalenceGadget<M> {
@@ -71,8 +71,11 @@ pub struct SparseMatrixVar<FV> {
     pub coeffs: Vec<Vec<(FV, usize)>>,
 }
 
-impl<F: PrimeField, CF: PrimeField, FV: AllocVar<F, CF>> AllocVar<SparseMatrix<F>, CF>
-    for SparseMatrixVar<FV>
+impl<F, CF, FV> AllocVar<SparseMatrix<F>, CF> for SparseMatrixVar<FV>
+where
+    F: PrimeField,
+    CF: PrimeField,
+    FV: AllocVar<F, CF>,
 {
     fn new_variable<T: Borrow<SparseMatrix<F>>>(
         cs: impl Into<Namespace<CF>>,

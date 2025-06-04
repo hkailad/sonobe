@@ -1,6 +1,7 @@
 use ark_crypto_primitives::sponge::Absorb;
+use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
-use ark_poly::Polynomial;
+use ark_poly::{DenseMultilinearExtension, Polynomial};
 use ark_serialize::CanonicalDeserialize;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::Rng;
@@ -9,18 +10,19 @@ use ark_std::Zero;
 use super::circuits::LCCCSVar;
 use super::Witness;
 use crate::arith::ccs::CCS;
-use crate::arith::{Arith, ArithRelation};
+use crate::arith::Arith;
 use crate::commitment::CommitmentScheme;
 use crate::folding::circuits::CF1;
 use crate::folding::traits::Inputize;
 use crate::folding::traits::{CommittedInstanceOps, Dummy};
+use crate::transcript::AbsorbNonNative;
 use crate::utils::mle::dense_vec_to_dense_mle;
 use crate::utils::vec::mat_vec_mul;
-use crate::{Curve, Error};
+use crate::Error;
 
 /// Linearized Committed CCS instance
 #[derive(Debug, Clone, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
-pub struct LCCCS<C: Curve> {
+pub struct LCCCS<C: CurveGroup> {
     // Commitment to witness
     pub C: C,
     // Relaxation factor of z for folded LCCCS
@@ -38,59 +40,58 @@ impl<F: PrimeField> CCS<F> {
         &self,
         rng: &mut R,
         cs_params: &CS::ProverParams,
-        z: &[F],
-    ) -> Result<(LCCCS<C>, Witness<F>), Error>
+        z: &[C::ScalarField],
+    ) -> Result<(LCCCS<C>, Witness<C::ScalarField>), Error>
     where
         // enforce that CCS's F is the C::ScalarField
-        C: Curve<ScalarField = F>,
+        C: CurveGroup<ScalarField = F>,
     {
-        let (w, x) = self.split_z(z);
+        let w: Vec<C::ScalarField> = z[(1 + self.l)..].to_vec();
         // if the commitment scheme is set to be hiding, set the random blinding parameter
         let r_w = if CS::is_hiding() {
-            F::rand(rng)
+            C::ScalarField::rand(rng)
         } else {
-            F::zero()
+            C::ScalarField::zero()
         };
         let C = CS::commit(cs_params, &w, &r_w)?;
 
-        let r_x: Vec<F> = (0..self.s).map(|_| F::rand(rng)).collect();
+        let r_x: Vec<C::ScalarField> = (0..self.s).map(|_| C::ScalarField::rand(rng)).collect();
 
-        // compute v_j
-        let v = self
+        let Mzs: Vec<DenseMultilinearExtension<F>> = self
             .M
             .iter()
-            .map(|M_j| {
-                let Mz = dense_vec_to_dense_mle(self.s, &mat_vec_mul(M_j, z)?);
-                Ok(Mz.evaluate(&r_x))
-            })
+            .map(|M_j| Ok(dense_vec_to_dense_mle(self.s, &mat_vec_mul(M_j, z)?)))
             .collect::<Result<_, Error>>()?;
+
+        // compute v_j
+        let v: Vec<F> = Mzs.iter().map(|Mz| Mz.evaluate(&r_x)).collect();
 
         Ok((
             LCCCS::<C> {
                 C,
                 u: z[0],
-                x,
+                x: z[1..(1 + self.l)].to_vec(),
                 r_x,
                 v,
             },
-            Witness::<F> { w, r_w },
+            Witness::<C::ScalarField> { w, r_w },
         ))
     }
 }
 
-impl<C: Curve> Dummy<&CCS<CF1<C>>> for LCCCS<C> {
+impl<C: CurveGroup> Dummy<&CCS<CF1<C>>> for LCCCS<C> {
     fn dummy(ccs: &CCS<CF1<C>>) -> Self {
         Self {
             C: C::zero(),
             u: CF1::<C>::zero(),
-            x: vec![CF1::<C>::zero(); ccs.n_public_inputs()],
+            x: vec![CF1::<C>::zero(); ccs.l],
             r_x: vec![CF1::<C>::zero(); ccs.s],
             v: vec![CF1::<C>::zero(); ccs.t],
         }
     }
 }
 
-impl<C: Curve> ArithRelation<Witness<CF1<C>>, LCCCS<C>> for CCS<CF1<C>> {
+impl<C: CurveGroup> Arith<Witness<CF1<C>>, LCCCS<C>> for CCS<CF1<C>> {
     type Evaluation = Vec<CF1<C>>;
 
     /// Perform the check of the LCCCS instance described at section 4.2,
@@ -116,13 +117,21 @@ impl<C: Curve> ArithRelation<Witness<CF1<C>>, LCCCS<C>> for CCS<CF1<C>> {
     }
 }
 
-impl<C: Curve> Absorb for LCCCS<C> {
+impl<C: CurveGroup> Absorb for LCCCS<C>
+where
+    C::ScalarField: Absorb,
+{
     fn to_sponge_bytes(&self, dest: &mut Vec<u8>) {
         C::ScalarField::batch_to_sponge_bytes(&self.to_sponge_field_elements_as_vec(), dest);
     }
 
     fn to_sponge_field_elements<F: PrimeField>(&self, dest: &mut Vec<F>) {
-        self.C.to_native_sponge_field_elements(dest);
+        // We cannot call `to_native_sponge_field_elements(dest)` directly, as
+        // `to_native_sponge_field_elements` needs `F` to be `C::ScalarField`,
+        // but here `F` is a generic `PrimeField`.
+        self.C
+            .to_native_sponge_field_elements_as_vec()
+            .to_sponge_field_elements(dest);
         self.u.to_sponge_field_elements(dest);
         self.x.to_sponge_field_elements(dest);
         self.r_x.to_sponge_field_elements(dest);
@@ -130,7 +139,7 @@ impl<C: Curve> Absorb for LCCCS<C> {
     }
 }
 
-impl<C: Curve> CommittedInstanceOps<C> for LCCCS<C> {
+impl<C: CurveGroup> CommittedInstanceOps<C> for LCCCS<C> {
     type Var = LCCCSVar<C>;
 
     fn get_commitments(&self) -> Vec<C> {
@@ -142,12 +151,10 @@ impl<C: Curve> CommittedInstanceOps<C> for LCCCS<C> {
     }
 }
 
-impl<C: Curve> Inputize<CF1<C>> for LCCCS<C> {
-    /// Returns the internal representation in the same order as how the value
-    /// is allocated in `LCCCS::new_input`.
-    fn inputize(&self) -> Vec<CF1<C>> {
+impl<C: CurveGroup> Inputize<C::ScalarField, LCCCSVar<C>> for LCCCS<C> {
+    fn inputize(&self) -> Vec<C::ScalarField> {
         [
-            &self.C.inputize_nonnative(),
+            &self.C.inputize(),
             &[self.u][..],
             &self.x,
             &self.r_x,
@@ -160,40 +167,41 @@ impl<C: Curve> Inputize<CF1<C>> for LCCCS<C> {
 #[cfg(test)]
 pub mod tests {
     use ark_pallas::{Fr, Projective};
-    use ark_std::{sync::Arc, test_rng, One, UniformRand};
+    use ark_std::test_rng;
+    use ark_std::One;
+    use ark_std::UniformRand;
+    use std::sync::Arc;
 
     use super::*;
     use crate::arith::{
         ccs::tests::{get_test_ccs, get_test_z},
         r1cs::R1CS,
-        ArithRelation,
+        Arith,
     };
     use crate::commitment::pedersen::Pedersen;
     use crate::utils::hypercube::BooleanHypercube;
     use crate::utils::virtual_polynomial::{build_eq_x_r_vec, VirtualPolynomial};
 
     // method for testing
-    pub fn compute_Ls<C: Curve>(
+    pub fn compute_Ls<C: CurveGroup>(
         ccs: &CCS<C::ScalarField>,
         lcccs: &LCCCS<C>,
         z: &[C::ScalarField],
     ) -> Result<Vec<VirtualPolynomial<C::ScalarField>>, Error> {
         let eq_rx = build_eq_x_r_vec(&lcccs.r_x)?;
-        let eq_rx_mle = Arc::new(dense_vec_to_dense_mle(ccs.s, &eq_rx));
+        let eq_rx_mle = dense_vec_to_dense_mle(ccs.s, &eq_rx);
 
-        let Ls = ccs
-            .M
-            .iter()
-            .map(|M_j| {
-                let mut L = VirtualPolynomial::<C::ScalarField>::new(ccs.s);
-                let Mz = vec![
-                    Arc::new(dense_vec_to_dense_mle(ccs.s, &mat_vec_mul(M_j, z)?)),
-                    eq_rx_mle.clone(),
-                ];
-                L.add_mle_list(Mz, C::ScalarField::one())?;
-                Ok(L)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+        let mut Ls = Vec::with_capacity(ccs.t);
+        for M_j in ccs.M.iter() {
+            let mut L = VirtualPolynomial::<C::ScalarField>::new(ccs.s);
+            let mut Mz = vec![dense_vec_to_dense_mle(ccs.s, &mat_vec_mul(M_j, z)?)];
+            Mz.push(eq_rx_mle.clone());
+            L.add_mle_list(
+                Mz.iter().map(|v| Arc::new(v.clone())),
+                C::ScalarField::one(),
+            )?;
+            Ls.push(L);
+        }
         Ok(Ls)
     }
 
@@ -208,7 +216,7 @@ pub mod tests {
         let ccs = CCS::from(r1cs);
         let z: Vec<Fr> = (0..n_cols).map(|_| Fr::rand(&mut rng)).collect();
 
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         let (lcccs, _) = ccs.to_lcccs::<_, Projective, Pedersen<Projective, false>, false>(
             &mut rng,
@@ -248,7 +256,7 @@ pub mod tests {
         let (bad_w, bad_x) = ccs.split_z(&bad_z);
         assert!(ccs.check_relation(&bad_w, &bad_x).is_err());
 
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
         // Compute v_j with the right z
         let (lcccs, _) = ccs.to_lcccs::<_, Projective, Pedersen<Projective>, false>(
             &mut rng,

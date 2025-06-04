@@ -1,20 +1,26 @@
+use ark_ec::CurveGroup;
+use ark_ff::PrimeField;
 use criterion::*;
 
 use folding_schemes::{
     frontend::{utils::CustomFCircuit, FCircuit},
-    Curve, Error, FoldingScheme,
+    Error, FoldingScheme,
 };
 
 pub(crate) fn bench_ivc_opt<
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     FS: FoldingScheme<C1, C2, CustomFCircuit<C1::ScalarField>>,
 >(
     c: &mut Criterion,
     name: String,
     n: usize,
     prep_param: FS::PreprocessorParam,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    C2::BaseField: PrimeField,
+{
     let fcircuit_size = 1 << n; // 2^n
 
     let f_circuit = CustomFCircuit::<C1::ScalarField>::new(fcircuit_size)?;
@@ -29,7 +35,7 @@ pub(crate) fn bench_ivc_opt<
 
     // warmup steps
     for _ in 0..5 {
-        fs.prove_step(rng, (), None)?;
+        fs.prove_step(rng, vec![], None)?;
     }
 
     let mut group = c.benchmark_group(format!(
@@ -38,7 +44,7 @@ pub(crate) fn bench_ivc_opt<
     ));
     group.significance_level(0.1).sample_size(10);
     group.bench_function("prove_step", |b| {
-        b.iter(|| -> Result<_, _> { black_box(fs.clone()).prove_step(rng, (), None) })
+        b.iter(|| -> Result<_, _> { black_box(fs.clone()).prove_step(rng, vec![], None) })
     });
 
     // verify the IVCProof

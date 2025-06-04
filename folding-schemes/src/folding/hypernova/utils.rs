@@ -1,5 +1,6 @@
+use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
-use ark_poly::MultilinearExtension;
+use ark_poly::{DenseMultilinearExtension, MultilinearExtension};
 use ark_std::One;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use crate::arith::ccs::CCS;
 use crate::utils::mle::dense_vec_to_dense_mle;
 use crate::utils::vec::mat_vec_mul;
 use crate::utils::virtual_polynomial::{build_eq_x_r_vec, eq_eval, VirtualPolynomial};
-use crate::{Curve, Error};
+use crate::Error;
 
 /// Compute the arrays of sigma_i and theta_i from step 4 corresponding to the LCCCS and CCCS
 /// instances
@@ -21,27 +22,27 @@ pub fn compute_sigmas_thetas<F: PrimeField>(
 ) -> Result<SigmasThetas<F>, Error> {
     let mut sigmas: Vec<Vec<F>> = Vec::new();
     for z_lcccs_i in z_lcccs {
-        let sigma_i = ccs
-            .M
+        let mut Mzs: Vec<DenseMultilinearExtension<F>> = vec![];
+        for M_j in ccs.M.iter() {
+            Mzs.push(dense_vec_to_dense_mle(ccs.s, &mat_vec_mul(M_j, z_lcccs_i)?));
+        }
+        let sigma_i = Mzs
             .iter()
-            .map(|M_j| {
-                let Mz = dense_vec_to_dense_mle(ccs.s, &mat_vec_mul(M_j, z_lcccs_i)?);
-                Ok(Mz.fix_variables(r_x_prime)[0])
-            })
-            .collect::<Result<Vec<F>, Error>>()?;
+            .map(|Mz| Mz.fix_variables(r_x_prime)[0])
+            .collect();
         sigmas.push(sigma_i);
     }
 
     let mut thetas: Vec<Vec<F>> = Vec::new();
     for z_cccs_i in z_cccs {
-        let theta_i = ccs
-            .M
+        let mut Mzs: Vec<DenseMultilinearExtension<F>> = vec![];
+        for M_j in ccs.M.iter() {
+            Mzs.push(dense_vec_to_dense_mle(ccs.s, &mat_vec_mul(M_j, z_cccs_i)?));
+        }
+        let theta_i = Mzs
             .iter()
-            .map(|M_j| {
-                let Mz = dense_vec_to_dense_mle(ccs.s, &mat_vec_mul(M_j, z_cccs_i)?);
-                Ok(Mz.fix_variables(r_x_prime)[0])
-            })
-            .collect::<Result<Vec<F>, Error>>()?;
+            .map(|Mz| Mz.fix_variables(r_x_prime)[0])
+            .collect();
         thetas.push(theta_i);
     }
     Ok(SigmasThetas(sigmas, thetas))
@@ -81,14 +82,14 @@ pub fn compute_c<F: PrimeField>(
     let e2 = eq_eval(beta, r_x_prime)?;
     for (k, thetas) in vec_thetas.iter().enumerate() {
         // + gamma^{t+1} * e2 * sum c_i * prod theta_j
-        let prods = ccs.S.iter().zip(&ccs.c).map(|(S_i, &c_i)| {
+        let mut lhs = F::zero();
+        for i in 0..ccs.q {
             let mut prod = F::one();
-            for &j in S_i {
+            for j in ccs.S[i].clone() {
                 prod *= thetas[j];
             }
-            c_i * prod
-        });
-        let lhs = F::sum(prods);
+            lhs += ccs.c[i] * prod;
+        }
         let gamma_t1 = gamma.pow([(mu * ccs.t + k) as u64]);
         c += gamma_t1 * e2 * lhs;
     }
@@ -96,14 +97,17 @@ pub fn compute_c<F: PrimeField>(
 }
 
 /// Compute g(x) polynomial for the given inputs.
-pub fn compute_g<C: Curve>(
+pub fn compute_g<C: CurveGroup>(
     ccs: &CCS<C::ScalarField>,
     running_instances: &[LCCCS<C>],
     z_lcccs: &[Vec<C::ScalarField>],
     z_cccs: &[Vec<C::ScalarField>],
     gamma: C::ScalarField,
     beta: &[C::ScalarField],
-) -> Result<VirtualPolynomial<C::ScalarField>, Error> {
+) -> Result<VirtualPolynomial<C::ScalarField>, Error>
+where
+    C::ScalarField: PrimeField,
+{
     assert_eq!(running_instances.len(), z_lcccs.len());
 
     let mut g = VirtualPolynomial::<C::ScalarField>::new(ccs.s);
@@ -128,21 +132,24 @@ pub fn compute_g<C: Curve>(
     }
 
     let eq_beta = build_eq_x_r_vec(beta)?;
-    let eq_beta_mle = Arc::new(dense_vec_to_dense_mle(ccs.s, &eq_beta));
+    let eq_beta_mle = dense_vec_to_dense_mle(ccs.s, &eq_beta);
 
     #[allow(clippy::needless_range_loop)]
     for k in 0..nu {
         // Q_k
-        for (S_i, &c_i) in ccs.S.iter().zip(&ccs.c) {
+        for i in 0..ccs.q {
             let mut Q_k = vec![];
-            for &j in S_i {
-                Q_k.push(Arc::new(dense_vec_to_dense_mle(
+            for &j in ccs.S[i].iter() {
+                Q_k.push(dense_vec_to_dense_mle(
                     ccs.s,
                     &mat_vec_mul(&ccs.M[j], &z_cccs[k])?,
-                )));
+                ));
             }
             Q_k.push(eq_beta_mle.clone());
-            g.add_mle_list(Q_k, c_i * gamma_pow)?;
+            g.add_mle_list(
+                Q_k.iter().map(|v| Arc::new(v.clone())),
+                ccs.c[i] * gamma_pow,
+            )?;
         }
         gamma_pow *= gamma;
     }
@@ -161,7 +168,7 @@ pub mod tests {
     use super::*;
     use crate::arith::{
         ccs::tests::{get_test_ccs, get_test_z},
-        Arith, ArithRelation,
+        Arith,
     };
     use crate::commitment::{pedersen::Pedersen, CommitmentScheme};
     use crate::folding::hypernova::lcccs::tests::compute_Ls;
@@ -169,7 +176,7 @@ pub mod tests {
     use crate::utils::mle::matrix_to_dense_mle;
     use crate::utils::multilinear_polynomial::tests::fix_last_variables;
 
-    /// Given M(x,y) matrix and a random field element `r`, test that ~M(r,y) is an s'-variable polynomial which
+    /// Given M(x,y) matrix and a random field element `r`, test that ~M(r,y) is is an s'-variable polynomial which
     /// compresses every column j of the M(x,y) matrix by performing a random linear combination between the elements
     /// of the column and the values eq_i(r) where i is the row of that element
     ///
@@ -234,7 +241,7 @@ pub mod tests {
         let r_x_prime: Vec<Fr> = (0..ccs.s).map(|_| Fr::rand(&mut rng)).collect();
 
         // Initialize a multifolding object
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
         let (lcccs_instance, _) =
             ccs.to_lcccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z1)?;
 
@@ -282,7 +289,7 @@ pub mod tests {
         let beta: Vec<Fr> = (0..ccs.s).map(|_| Fr::rand(&mut rng)).collect();
 
         // Initialize a multifolding object
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
         let (lcccs_instance, _) =
             ccs.to_lcccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z1)?;
 

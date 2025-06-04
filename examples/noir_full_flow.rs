@@ -9,16 +9,19 @@
 /// - generate the Solidity contract that verifies the proof
 /// - verify the proof in the EVM
 ///
-use ark_bn254::{Bn254, Fr, G1Projective as G1};
+use ark_bn254::{constraints::GVar, Bn254, Fr, G1Projective as G1};
 
 use ark_groth16::Groth16;
-use ark_grumpkin::Projective as G2;
+use ark_grumpkin::{constraints::GVar as GVar2, Projective as G2};
 
-use experimental_frontends::{noir::NoirFCircuit, utils::VecF};
+use experimental_frontends::noir::NoirFCircuit;
 use folding_schemes::{
     commitment::{kzg::KZG, pedersen::Pedersen},
     folding::{
-        nova::{decider_eth::Decider as DeciderEth, Nova, PreprocessorParam},
+        nova::{
+            decider_eth::{prepare_calldata, Decider as DeciderEth},
+            Nova, PreprocessorParam,
+        },
         traits::CommittedInstanceOps,
     },
     frontend::FCircuit,
@@ -27,11 +30,9 @@ use folding_schemes::{
 };
 use std::{path::Path, time::Instant};
 
-use solidity_verifiers::calldata::{
-    prepare_calldata_for_nova_cyclefold_verifier, NovaVerificationMode,
-};
 use solidity_verifiers::{
     evm::{compile_solidity, Evm},
+    utils::get_function_selector_for_nova_cyclefold_verifier,
     verifiers::nova_cyclefold::get_decider_template_for_cyclefold_decider,
     NovaCycleFoldVerifierKey,
 };
@@ -41,19 +42,20 @@ fn main() -> Result<(), Error> {
     let z_0 = vec![Fr::from(1)];
 
     // initialize the noir fcircuit
-    const EXT_INP_LEN: usize = 0;
-    const STATE_LEN: usize = 1;
-    let f_circuit = NoirFCircuit::<Fr, STATE_LEN, EXT_INP_LEN>::new(
+    let f_circuit = NoirFCircuit::new((
         Path::new("./experimental-frontends/src/noir/test_folder/test_mimc/target/test_mimc.json")
             .into(),
-    )?;
+        1,
+        0,
+    ))?;
 
-    pub type N =
-        Nova<G1, G2, NoirFCircuit<Fr, STATE_LEN, EXT_INP_LEN>, KZG<'static, Bn254>, Pedersen<G2>>;
+    pub type N = Nova<G1, GVar, G2, GVar2, NoirFCircuit<Fr>, KZG<'static, Bn254>, Pedersen<G2>>;
     pub type D = DeciderEth<
         G1,
+        GVar,
         G2,
-        NoirFCircuit<Fr, STATE_LEN, EXT_INP_LEN>,
+        GVar2,
+        NoirFCircuit<Fr>,
         KZG<'static, Bn254>,
         Pedersen<G2>,
         Groth16<Bn254>,
@@ -67,17 +69,16 @@ fn main() -> Result<(), Error> {
     let nova_preprocess_params = PreprocessorParam::new(poseidon_config, f_circuit.clone());
     let nova_params = N::preprocess(&mut rng, &nova_preprocess_params)?;
 
-    // prepare the Decider prover & verifier params
-    let (decider_pp, decider_vp) =
-        D::preprocess(&mut rng, (nova_params.clone(), f_circuit.state_len()))?;
-
     // initialize the folding scheme engine, in our case we use Nova
     let mut nova = N::init(&nova_params, f_circuit.clone(), z_0)?;
+
+    // prepare the Decider prover & verifier params
+    let (decider_pp, decider_vp) = D::preprocess(&mut rng, nova_params.clone(), nova.clone())?;
 
     // run n steps of the folding iteration
     for i in 0..5 {
         let start = Instant::now();
-        nova.prove_step(rng, VecF(vec![]), None)?;
+        nova.prove_step(rng, vec![], None)?;
         println!("Nova::prove_step {}: {:?}", i, start.elapsed());
     }
     // verify the last IVC proof
@@ -104,14 +105,17 @@ fn main() -> Result<(), Error> {
     println!("Decider proof verification: {}", verified);
 
     // Now, let's generate the Solidity code that verifies this Decider final proof
-    let calldata: Vec<u8> = prepare_calldata_for_nova_cyclefold_verifier(
-        NovaVerificationMode::Explicit,
+    let function_selector =
+        get_function_selector_for_nova_cyclefold_verifier(nova.z_0.len() * 2 + 1);
+
+    let calldata: Vec<u8> = prepare_calldata(
+        function_selector,
         nova.i,
         nova.z_0,
         nova.z_i,
         &nova.U_i,
         &nova.u_i,
-        &proof,
+        proof,
     )?;
 
     // prepare the setup params for the solidity verifier
@@ -135,7 +139,7 @@ fn main() -> Result<(), Error> {
         decider_solidity_code.clone(),
     )?;
     fs::write("./examples/solidity-calldata.calldata", calldata.clone())?;
-    let s = solidity_verifiers::calldata::get_formatted_calldata(calldata.clone());
+    let s = solidity_verifiers::utils::get_formatted_calldata(calldata.clone());
     fs::write("./examples/solidity-calldata.inputs", s.join(",\n")).expect("");
     Ok(())
 }

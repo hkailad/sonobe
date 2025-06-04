@@ -9,10 +9,10 @@
 /// - generate the Solidity contract that verifies the proof
 /// - verify the proof in the EVM
 ///
-use ark_bn254::{Bn254, Fr, G1Projective as G1};
+use ark_bn254::{constraints::GVar, Bn254, Fr, G1Projective as G1};
 use ark_ff::PrimeField;
 use ark_groth16::Groth16;
-use ark_grumpkin::Projective as G2;
+use ark_grumpkin::{constraints::GVar as GVar2, Projective as G2};
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
@@ -22,18 +22,19 @@ use std::time::Instant;
 use folding_schemes::{
     commitment::{kzg::KZG, pedersen::Pedersen},
     folding::{
-        nova::{decider_eth::Decider as DeciderEth, Nova, PreprocessorParam},
+        nova::{
+            decider_eth::{prepare_calldata, Decider as DeciderEth},
+            Nova, PreprocessorParam,
+        },
         traits::CommittedInstanceOps,
     },
     frontend::FCircuit,
     transcript::poseidon::poseidon_canonical_config,
     Decider, Error, FoldingScheme,
 };
-use solidity_verifiers::calldata::{
-    prepare_calldata_for_nova_cyclefold_verifier, NovaVerificationMode,
-};
 use solidity_verifiers::{
     evm::{compile_solidity, Evm},
+    utils::get_function_selector_for_nova_cyclefold_verifier,
     verifiers::nova_cyclefold::get_decider_template_for_cyclefold_decider,
     NovaCycleFoldVerifierKey,
 };
@@ -45,21 +46,29 @@ pub struct CubicFCircuit<F: PrimeField> {
 }
 impl<F: PrimeField> FCircuit<F> for CubicFCircuit<F> {
     type Params = ();
-    type ExternalInputs = ();
-    type ExternalInputsVar = ();
-
     fn new(_params: Self::Params) -> Result<Self, Error> {
         Ok(Self { _f: PhantomData })
     }
     fn state_len(&self) -> usize {
         1
     }
+    fn external_inputs_len(&self) -> usize {
+        0
+    }
+    fn step_native(
+        &self,
+        _i: usize,
+        z_i: Vec<F>,
+        _external_inputs: Vec<F>,
+    ) -> Result<Vec<F>, Error> {
+        Ok(vec![z_i[0] * z_i[0] * z_i[0] + z_i[0] + F::from(5_u32)])
+    }
     fn generate_step_constraints(
         &self,
         cs: ConstraintSystemRef<F>,
         _i: usize,
         z_i: Vec<FpVar<F>>,
-        _external_inputs: Self::ExternalInputsVar,
+        _external_inputs: Vec<FpVar<F>>,
     ) -> Result<Vec<FpVar<F>>, SynthesisError> {
         let five = FpVar::<F>::new_constant(cs.clone(), F::from(5u32))?;
         let z_i = z_i[0].clone();
@@ -75,9 +84,19 @@ fn main() -> Result<(), Error> {
 
     let f_circuit = CubicFCircuit::<Fr>::new(())?;
 
-    pub type N = Nova<G1, G2, CubicFCircuit<Fr>, KZG<'static, Bn254>, Pedersen<G2>, false>;
-    pub type D =
-        DeciderEth<G1, G2, CubicFCircuit<Fr>, KZG<'static, Bn254>, Pedersen<G2>, Groth16<Bn254>, N>;
+    pub type N =
+        Nova<G1, GVar, G2, GVar2, CubicFCircuit<Fr>, KZG<'static, Bn254>, Pedersen<G2>, false>;
+    pub type D = DeciderEth<
+        G1,
+        GVar,
+        G2,
+        GVar2,
+        CubicFCircuit<Fr>,
+        KZG<'static, Bn254>,
+        Pedersen<G2>,
+        Groth16<Bn254>,
+        N,
+    >;
 
     let poseidon_config = poseidon_canonical_config::<Fr>();
     let mut rng = ark_std::rand::rngs::OsRng;
@@ -86,17 +105,16 @@ fn main() -> Result<(), Error> {
     let nova_preprocess_params = PreprocessorParam::new(poseidon_config.clone(), f_circuit);
     let nova_params = N::preprocess(&mut rng, &nova_preprocess_params)?;
 
-    // prepare the Decider prover & verifier params
-    let (decider_pp, decider_vp) =
-        D::preprocess(&mut rng, (nova_params.clone(), f_circuit.state_len()))?;
-
     // initialize the folding scheme engine, in our case we use Nova
     let mut nova = N::init(&nova_params, f_circuit, z_0)?;
+
+    // prepare the Decider prover & verifier params
+    let (decider_pp, decider_vp) = D::preprocess(&mut rng, nova_params, nova.clone())?;
 
     // run n steps of the folding iteration
     for i in 0..n_steps {
         let start = Instant::now();
-        nova.prove_step(rng, (), None)?;
+        nova.prove_step(rng, vec![], None)?;
         println!("Nova::prove_step {}: {:?}", i, start.elapsed());
     }
 
@@ -117,14 +135,17 @@ fn main() -> Result<(), Error> {
     println!("Decider proof verification: {}", verified);
 
     // Now, let's generate the Solidity code that verifies this Decider final proof
-    let calldata: Vec<u8> = prepare_calldata_for_nova_cyclefold_verifier(
-        NovaVerificationMode::Explicit,
+    let function_selector =
+        get_function_selector_for_nova_cyclefold_verifier(nova.z_0.len() * 2 + 1);
+
+    let calldata: Vec<u8> = prepare_calldata(
+        function_selector,
         nova.i,
         nova.z_0,
         nova.z_i,
         &nova.U_i,
         &nova.u_i,
-        &proof,
+        proof,
     )?;
 
     // prepare the setup params for the solidity verifier
@@ -148,7 +169,7 @@ fn main() -> Result<(), Error> {
         decider_solidity_code.clone(),
     )?;
     fs::write("./examples/solidity-calldata.calldata", calldata.clone())?;
-    let s = solidity_verifiers::calldata::get_formatted_calldata(calldata.clone());
+    let s = solidity_verifiers::utils::get_formatted_calldata(calldata.clone());
     fs::write("./examples/solidity-calldata.inputs", s.join(",\n")).expect("");
     Ok(())
 }

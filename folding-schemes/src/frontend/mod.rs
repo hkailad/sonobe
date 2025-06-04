@@ -1,6 +1,6 @@
 use crate::Error;
 use ark_ff::PrimeField;
-use ark_r1cs_std::{alloc::AllocVar, fields::fp::FpVar};
+use ark_r1cs_std::fields::fp::FpVar;
 use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
 use ark_std::fmt::Debug;
 
@@ -10,14 +10,8 @@ pub mod utils;
 /// inside the agmented F' function).
 /// The parameter z_i denotes the current state, and z_{i+1} denotes the next state after applying
 /// the step.
-/// Note that the external inputs for the specific circuit are defined at the implementation of
-/// both `FCircuit::ExternalInputs` and `FCircuit::ExternalInputsVar`, where the `Default` trait
-/// implementation for the `ExternalInputs` returns the initialized data structure (ie. if the type
-/// contains a vector, it is initialized at the expected length).
 pub trait FCircuit<F: PrimeField>: Clone + Debug {
     type Params: Debug;
-    type ExternalInputs: Clone + Default + Debug;
-    type ExternalInputsVar: Clone + Debug + AllocVar<Self::ExternalInputs, F>;
 
     /// returns a new FCircuit instance
     fn new(params: Self::Params) -> Result<Self, Error>;
@@ -25,6 +19,21 @@ pub trait FCircuit<F: PrimeField>: Clone + Debug {
     /// returns the number of elements in the state of the FCircuit, which corresponds to the
     /// FCircuit inputs.
     fn state_len(&self) -> usize;
+
+    /// returns the number of elements in the external inputs used by the FCircuit. External inputs
+    /// are optional, and in case no external inputs are used, this method should return 0.
+    fn external_inputs_len(&self) -> usize;
+
+    /// computes the next state values in place, assigning z_{i+1} into z_i, and computing the new
+    /// z_{i+1}
+    fn step_native(
+        // this method uses self, so that each FCircuit implementation (and different frontends)
+        // can hold a state if needed to store data to compute the next state.
+        &self,
+        i: usize,
+        z_i: Vec<F>,
+        external_inputs: Vec<F>, // inputs that are not part of the state
+    ) -> Result<Vec<F>, Error>;
 
     /// generates the constraints for the step of F for the given z_i
     fn generate_step_constraints(
@@ -34,7 +43,7 @@ pub trait FCircuit<F: PrimeField>: Clone + Debug {
         cs: ConstraintSystemRef<F>,
         i: usize,
         z_i: Vec<FpVar<F>>,
-        external_inputs: Self::ExternalInputsVar, // inputs that are not part of the state
+        external_inputs: Vec<FpVar<F>>, // inputs that are not part of the state
     ) -> Result<Vec<FpVar<F>>, SynthesisError>;
 }
 
@@ -44,7 +53,7 @@ pub mod tests {
     use ark_bn254::Fr;
     use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 
-    use utils::{custom_step_native, CubicFCircuit, CustomFCircuit, WrapperCircuit};
+    use utils::{CubicFCircuit, CustomFCircuit, WrapperCircuit};
 
     #[test]
     fn test_testfcircuit() -> Result<(), Error> {
@@ -70,7 +79,7 @@ pub mod tests {
         let wrapper_circuit = WrapperCircuit::<Fr, CustomFCircuit<Fr>> {
             FC: custom_circuit,
             z_i: Some(z_i.clone()),
-            z_i1: Some(custom_step_native(z_i, n_constraints)),
+            z_i1: Some(custom_circuit.step_native(0, z_i, vec![])?),
         };
         wrapper_circuit.generate_constraints(cs.clone())?;
         assert_eq!(cs.num_constraints(), n_constraints);

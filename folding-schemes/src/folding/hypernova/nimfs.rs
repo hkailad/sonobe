@@ -1,7 +1,9 @@
+use ark_crypto_primitives::sponge::Absorb;
+use ark_ec::CurveGroup;
 use ark_ff::{BigInteger, Field, PrimeField};
 use ark_poly::univariate::DensePolynomial;
 use ark_poly::{DenseUVPolynomial, Polynomial};
-use ark_std::{fmt::Debug, marker::PhantomData, One, Zero};
+use ark_std::{One, Zero};
 
 use super::{
     cccs::CCCS,
@@ -9,7 +11,7 @@ use super::{
     utils::{compute_c, compute_g, compute_sigmas_thetas},
     Witness,
 };
-use crate::arith::{ccs::CCS, Arith};
+use crate::arith::ccs::CCS;
 use crate::constants::NOVA_N_BITS_RO;
 use crate::folding::circuits::CF1;
 use crate::folding::traits::Dummy;
@@ -17,16 +19,19 @@ use crate::transcript::Transcript;
 use crate::utils::sum_check::structs::{IOPProof as SumCheckProof, IOPProverMessage};
 use crate::utils::sum_check::{IOPSumCheck, SumCheck};
 use crate::utils::virtual_polynomial::VPAuxInfo;
-use crate::{Curve, Error};
+use crate::Error;
+
+use std::fmt::Debug;
+use std::marker::PhantomData;
 
 /// NIMFSProof defines a multifolding proof
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NIMFSProof<C: Curve> {
+pub struct NIMFSProof<C: CurveGroup> {
     pub sc_proof: SumCheckProof<C::ScalarField>,
     pub sigmas_thetas: SigmasThetas<C::ScalarField>,
 }
 
-impl<C: Curve> Dummy<(usize, usize, usize, usize)> for NIMFSProof<C> {
+impl<C: CurveGroup> Dummy<(usize, usize, usize, usize)> for NIMFSProof<C> {
     fn dummy((s, t, mu, nu): (usize, usize, usize, usize)) -> Self {
         // use 'C::ScalarField::one()' instead of 'zero()' to enforce the NIMFSProof to have the
         // same in-circuit representation to match the number of constraints of an actual proof.
@@ -48,7 +53,7 @@ impl<C: Curve> Dummy<(usize, usize, usize, usize)> for NIMFSProof<C> {
     }
 }
 
-impl<C: Curve> Dummy<(&CCS<CF1<C>>, usize, usize)> for NIMFSProof<C> {
+impl<C: CurveGroup> Dummy<(&CCS<CF1<C>>, usize, usize)> for NIMFSProof<C> {
     fn dummy((ccs, mu, nu): (&CCS<CF1<C>>, usize, usize)) -> Self {
         NIMFSProof::dummy((ccs.s, ccs.t, mu, nu))
     }
@@ -60,12 +65,15 @@ pub struct SigmasThetas<F: PrimeField>(pub Vec<Vec<F>>, pub Vec<Vec<F>>);
 #[derive(Debug)]
 /// Implements the Non-Interactive Multi Folding Scheme described in section 5 of
 /// [HyperNova](https://eprint.iacr.org/2023/573.pdf)
-pub struct NIMFS<C: Curve, T: Transcript<C::ScalarField>> {
+pub struct NIMFS<C: CurveGroup, T: Transcript<C::ScalarField>> {
     pub _c: PhantomData<C>,
     pub _t: PhantomData<T>,
 }
 
-impl<C: Curve, T: Transcript<C::ScalarField>> NIMFS<C, T> {
+impl<C: CurveGroup, T: Transcript<C::ScalarField>> NIMFS<C, T>
+where
+    C::ScalarField: Absorb,
+{
     pub fn fold(
         lcccs: &[LCCCS<C>],
         cccs: &[CCCS<C>],
@@ -313,7 +321,7 @@ impl<C: Curve, T: Transcript<C::ScalarField>> NIMFS<C, T> {
         let beta: Vec<C::ScalarField> = transcript.get_challenges(ccs.s);
 
         let vp_aux_info = VPAuxInfo::<C::ScalarField> {
-            max_degree: ccs.degree() + 1,
+            max_degree: ccs.d + 1,
             num_variables: ccs.s,
             phantom: PhantomData::<C::ScalarField>,
         };
@@ -395,7 +403,7 @@ pub mod tests {
     use super::*;
     use crate::arith::{
         ccs::tests::{get_test_ccs, get_test_z},
-        ArithRelation,
+        Arith,
     };
     use crate::transcript::poseidon::poseidon_canonical_config;
     use ark_crypto_primitives::sponge::poseidon::PoseidonSponge;
@@ -421,7 +429,7 @@ pub mod tests {
 
         let sigmas_thetas = compute_sigmas_thetas(&ccs, &[z1.clone()], &[z2.clone()], &r_x_prime)?;
 
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         let (lcccs, w1) = ccs.to_lcccs::<_, Projective, Pedersen<Projective>, false>(
             &mut rng,
@@ -462,7 +470,7 @@ pub mod tests {
 
         // Create a basic CCS circuit
         let ccs = get_test_ccs::<Fr>();
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         // Generate a satisfying witness
         let z_1 = get_test_z(3);
@@ -518,7 +526,7 @@ pub mod tests {
 
         let ccs = get_test_ccs::<Fr>();
 
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         // LCCCS witness
         let z_1 = get_test_z(2);
@@ -578,7 +586,7 @@ pub mod tests {
 
         // Create a basic CCS circuit
         let ccs = get_test_ccs::<Fr>();
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         let mu = 10;
         let nu = 15;
@@ -650,14 +658,14 @@ pub mod tests {
     }
 
     /// Test that generates mu>1 and nu>1 instances, and folds them in a single multifolding step
-    /// and repeats the process by doing multiple steps.
+    /// and repeats the process doing multiple steps.
     #[test]
     pub fn test_multifolding_mu_nu_instances_multiple_steps() -> Result<(), Error> {
         let mut rng = test_rng();
 
         // Create a basic CCS circuit
         let ccs = get_test_ccs::<Fr>();
-        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n_witnesses())?;
+        let (pedersen_params, _) = Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1)?;
 
         let poseidon_config = poseidon_canonical_config::<Fr>();
         // Prover's transcript

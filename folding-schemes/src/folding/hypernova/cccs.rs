@@ -1,4 +1,5 @@
 use ark_crypto_primitives::sponge::Absorb;
+use ark_ec::CurveGroup;
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalDeserialize;
 use ark_serialize::CanonicalSerialize;
@@ -6,19 +7,20 @@ use ark_std::{rand::Rng, sync::Arc, One, Zero};
 
 use super::circuits::CCCSVar;
 use super::Witness;
-use crate::arith::{ccs::CCS, Arith, ArithRelation};
+use crate::arith::{ccs::CCS, Arith};
 use crate::commitment::CommitmentScheme;
 use crate::folding::circuits::CF1;
 use crate::folding::traits::Inputize;
 use crate::folding::traits::{CommittedInstanceOps, Dummy};
+use crate::transcript::AbsorbNonNative;
 use crate::utils::mle::dense_vec_to_dense_mle;
 use crate::utils::vec::{is_zero_vec, mat_vec_mul};
 use crate::utils::virtual_polynomial::{build_eq_x_r_vec, VirtualPolynomial};
-use crate::{Curve, Error};
+use crate::Error;
 
 /// Committed CCS instance
 #[derive(Debug, Clone, PartialEq, Eq, CanonicalSerialize, CanonicalDeserialize)]
-pub struct CCCS<C: Curve> {
+pub struct CCCS<C: CurveGroup> {
     // Commitment to witness
     pub C: C,
     // Public input/output
@@ -30,38 +32,41 @@ impl<F: PrimeField> CCS<F> {
         &self,
         rng: &mut R,
         cs_params: &CS::ProverParams,
-        z: &[F],
-    ) -> Result<(CCCS<C>, Witness<F>), Error>
+        z: &[C::ScalarField],
+    ) -> Result<(CCCS<C>, Witness<C::ScalarField>), Error>
     where
         // enforce that CCS's F is the C::ScalarField
-        C: Curve<ScalarField = F>,
+        C: CurveGroup<ScalarField = F>,
     {
-        let (w, x) = self.split_z(z);
+        let w: Vec<C::ScalarField> = z[(1 + self.l)..].to_vec();
 
         // if the commitment scheme is set to be hiding, set the random blinding parameter
         let r_w = if CS::is_hiding() {
-            F::rand(rng)
+            C::ScalarField::rand(rng)
         } else {
-            F::zero()
+            C::ScalarField::zero()
         };
         let C = CS::commit(cs_params, &w, &r_w)?;
 
-        Ok((CCCS::<C> { C, x }, Witness::<F> { w, r_w }))
+        Ok((
+            CCCS::<C> {
+                C,
+                x: z[1..(1 + self.l)].to_vec(),
+            },
+            Witness::<C::ScalarField> { w, r_w },
+        ))
     }
 
     /// Computes q(x) = \sum^q c_i * \prod_{j \in S_i} ( \sum_{y \in {0,1}^s'} M_j(x, y) * z(y) )
     /// polynomial over x
     pub fn compute_q(&self, z: &[F]) -> Result<VirtualPolynomial<F>, Error> {
         let mut q_x = VirtualPolynomial::<F>::new(self.s);
-        for (S_i, &c_i) in self.S.iter().zip(&self.c) {
+        for i in 0..self.q {
             let mut Q_k = vec![];
-            for &j in S_i {
-                Q_k.push(Arc::new(dense_vec_to_dense_mle(
-                    self.s,
-                    &mat_vec_mul(&self.M[j], z)?,
-                )));
+            for &j in self.S[i].iter() {
+                Q_k.push(dense_vec_to_dense_mle(self.s, &mat_vec_mul(&self.M[j], z)?));
             }
-            q_x.add_mle_list(Q_k, c_i)?;
+            q_x.add_mle_list(Q_k.iter().map(|v| Arc::new(v.clone())), self.c[i])?;
         }
         Ok(q_x)
     }
@@ -71,34 +76,31 @@ impl<F: PrimeField> CCS<F> {
     /// polynomial over x
     pub fn compute_Q(&self, z: &[F], beta: &[F]) -> Result<VirtualPolynomial<F>, Error> {
         let eq_beta = build_eq_x_r_vec(beta)?;
-        let eq_beta_mle = Arc::new(dense_vec_to_dense_mle(self.s, &eq_beta));
+        let eq_beta_mle = dense_vec_to_dense_mle(self.s, &eq_beta);
 
         let mut Q = VirtualPolynomial::<F>::new(self.s);
-        for (S_i, &c_i) in self.S.iter().zip(&self.c) {
+        for i in 0..self.q {
             let mut Q_k = vec![];
-            for &j in S_i {
-                Q_k.push(Arc::new(dense_vec_to_dense_mle(
-                    self.s,
-                    &mat_vec_mul(&self.M[j], z)?,
-                )));
+            for &j in self.S[i].iter() {
+                Q_k.push(dense_vec_to_dense_mle(self.s, &mat_vec_mul(&self.M[j], z)?));
             }
             Q_k.push(eq_beta_mle.clone());
-            Q.add_mle_list(Q_k, c_i)?;
+            Q.add_mle_list(Q_k.iter().map(|v| Arc::new(v.clone())), self.c[i])?;
         }
         Ok(Q)
     }
 }
 
-impl<C: Curve> Dummy<&CCS<CF1<C>>> for CCCS<C> {
+impl<C: CurveGroup> Dummy<&CCS<CF1<C>>> for CCCS<C> {
     fn dummy(ccs: &CCS<CF1<C>>) -> Self {
         Self {
             C: C::zero(),
-            x: vec![CF1::<C>::zero(); ccs.n_public_inputs()],
+            x: vec![CF1::<C>::zero(); ccs.l],
         }
     }
 }
 
-impl<C: Curve> ArithRelation<Witness<CF1<C>>, CCCS<C>> for CCS<CF1<C>> {
+impl<C: CurveGroup> Arith<Witness<CF1<C>>, CCCS<C>> for CCS<CF1<C>> {
     type Evaluation = Vec<CF1<C>>;
 
     fn eval_relation(&self, w: &Witness<CF1<C>>, u: &CCCS<C>) -> Result<Self::Evaluation, Error> {
@@ -120,18 +122,26 @@ impl<C: Curve> ArithRelation<Witness<CF1<C>>, CCCS<C>> for CCS<CF1<C>> {
     }
 }
 
-impl<C: Curve> Absorb for CCCS<C> {
+impl<C: CurveGroup> Absorb for CCCS<C>
+where
+    C::ScalarField: Absorb,
+{
     fn to_sponge_bytes(&self, dest: &mut Vec<u8>) {
         C::ScalarField::batch_to_sponge_bytes(&self.to_sponge_field_elements_as_vec(), dest);
     }
 
     fn to_sponge_field_elements<F: PrimeField>(&self, dest: &mut Vec<F>) {
-        self.C.to_native_sponge_field_elements(dest);
+        // We cannot call `to_native_sponge_field_elements(dest)` directly, as
+        // `to_native_sponge_field_elements` needs `F` to be `C::ScalarField`,
+        // but here `F` is a generic `PrimeField`.
+        self.C
+            .to_native_sponge_field_elements_as_vec()
+            .to_sponge_field_elements(dest);
         self.x.to_sponge_field_elements(dest);
     }
 }
 
-impl<C: Curve> CommittedInstanceOps<C> for CCCS<C> {
+impl<C: CurveGroup> CommittedInstanceOps<C> for CCCS<C> {
     type Var = CCCSVar<C>;
 
     fn get_commitments(&self) -> Vec<C> {
@@ -143,11 +153,9 @@ impl<C: Curve> CommittedInstanceOps<C> for CCCS<C> {
     }
 }
 
-impl<C: Curve> Inputize<CF1<C>> for CCCS<C> {
-    /// Returns the internal representation in the same order as how the value
-    /// is allocated in `CCCSVar::new_input`.
-    fn inputize(&self) -> Vec<CF1<C>> {
-        [&self.C.inputize_nonnative()[..], &self.x].concat()
+impl<C: CurveGroup> Inputize<C::ScalarField, CCCSVar<C>> for CCCS<C> {
+    fn inputize(&self) -> Vec<C::ScalarField> {
+        [&self.C.inputize()[..], &self.x].concat()
     }
 }
 

@@ -139,32 +139,25 @@ impl NovaCycleFoldVerifierKey {
 
 #[cfg(test)]
 mod tests {
-    use ark_bn254::{Bn254, Fr, G1Projective as G1, G1Projective};
+    use ark_bn254::{constraints::GVar, Bn254, Fr, G1Projective as G1};
     use ark_ff::PrimeField;
     use ark_groth16::Groth16;
-    use ark_grumpkin::Projective as G2;
+    use ark_grumpkin::{constraints::GVar as GVar2, Projective as G2};
     use ark_r1cs_std::alloc::AllocVar;
     use ark_r1cs_std::fields::fp::FpVar;
     use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
+    use ark_std::Zero;
     use askama::Template;
     use std::marker::PhantomData;
     use std::time::Instant;
 
-    use super::{DeciderVerifierParam, NovaCycleFoldDecider};
-    use crate::calldata::NovaVerificationMode::{Explicit, Opaque, OpaqueWithInputs};
-    use crate::calldata::{prepare_calldata_for_nova_cyclefold_verifier, NovaVerificationMode};
-    use crate::verifiers::tests::{setup, DEFAULT_SETUP_LEN};
-    use crate::{
-        evm::{compile_solidity, save_solidity, Evm},
-        utils::HeaderInclusion,
-        verifiers::nova_cyclefold::get_decider_template_for_cyclefold_decider,
-        NovaCycleFoldVerifierKey, ProtocolVerifierKey,
-    };
-    use folding_schemes::folding::nova::decider_eth::Proof;
     use folding_schemes::{
         commitment::{kzg::KZG, pedersen::Pedersen},
         folding::{
-            nova::{decider_eth::Decider as DeciderEth, Nova, PreprocessorParam},
+            nova::{
+                decider_eth::{prepare_calldata, Decider as DeciderEth},
+                Nova, PreprocessorParam,
+            },
             traits::CommittedInstanceOps,
         },
         frontend::FCircuit,
@@ -172,9 +165,27 @@ mod tests {
         Decider, Error, FoldingScheme,
     };
 
-    type NOVA<FC> = Nova<G1, G2, FC, KZG<'static, Bn254>, Pedersen<G2>, false>;
-    type DECIDER<FC> =
-        DeciderEth<G1, G2, FC, KZG<'static, Bn254>, Pedersen<G2>, Groth16<Bn254>, NOVA<FC>>;
+    use super::{DeciderVerifierParam, NovaCycleFoldDecider};
+    use crate::verifiers::tests::{setup, DEFAULT_SETUP_LEN};
+    use crate::{
+        evm::{compile_solidity, save_solidity, Evm},
+        utils::{get_function_selector_for_nova_cyclefold_verifier, HeaderInclusion},
+        verifiers::nova_cyclefold::get_decider_template_for_cyclefold_decider,
+        NovaCycleFoldVerifierKey, ProtocolVerifierKey,
+    };
+
+    type NOVA<FC> = Nova<G1, GVar, G2, GVar2, FC, KZG<'static, Bn254>, Pedersen<G2>, false>;
+    type DECIDER<FC> = DeciderEth<
+        G1,
+        GVar,
+        G2,
+        GVar2,
+        FC,
+        KZG<'static, Bn254>,
+        Pedersen<G2>,
+        Groth16<Bn254>,
+        NOVA<FC>,
+    >;
 
     type FS_PP<FC> = <NOVA<FC> as FoldingScheme<G1, G2, FC>>::ProverParam;
     type FS_VP<FC> = <NOVA<FC> as FoldingScheme<G1, G2, FC>>::VerifierParam;
@@ -188,20 +199,29 @@ mod tests {
     }
     impl<F: PrimeField> FCircuit<F> for CubicFCircuit<F> {
         type Params = ();
-        type ExternalInputs = ();
-        type ExternalInputsVar = ();
         fn new(_params: Self::Params) -> Result<Self, Error> {
             Ok(Self { _f: PhantomData })
         }
         fn state_len(&self) -> usize {
             1
         }
+        fn external_inputs_len(&self) -> usize {
+            0
+        }
+        fn step_native(
+            &self,
+            _i: usize,
+            z_i: Vec<F>,
+            _external_inputs: Vec<F>,
+        ) -> Result<Vec<F>, Error> {
+            Ok(vec![z_i[0] * z_i[0] * z_i[0] + z_i[0] + F::from(5_u32)])
+        }
         fn generate_step_constraints(
             &self,
             cs: ConstraintSystemRef<F>,
             _i: usize,
             z_i: Vec<FpVar<F>>,
-            _external_inputs: Self::ExternalInputsVar,
+            _external_inputs: Vec<FpVar<F>>,
         ) -> Result<Vec<FpVar<F>>, SynthesisError> {
             let five = FpVar::<F>::new_constant(cs.clone(), F::from(5u32))?;
             let z_i = z_i[0].clone();
@@ -221,8 +241,6 @@ mod tests {
     }
     impl<F: PrimeField> FCircuit<F> for MultiInputsFCircuit<F> {
         type Params = ();
-        type ExternalInputs = ();
-        type ExternalInputsVar = ();
 
         fn new(_params: Self::Params) -> Result<Self, Error> {
             Ok(Self { _f: PhantomData })
@@ -230,13 +248,34 @@ mod tests {
         fn state_len(&self) -> usize {
             5
         }
+        fn external_inputs_len(&self) -> usize {
+            0
+        }
+
+        /// computes the next state values in place, assigning z_{i+1} into z_i, and computing the new
+        /// z_{i+1}
+        fn step_native(
+            &self,
+            _i: usize,
+            z_i: Vec<F>,
+            _external_inputs: Vec<F>,
+        ) -> Result<Vec<F>, Error> {
+            let a = z_i[0] + F::from(4_u32);
+            let b = z_i[1] + F::from(40_u32);
+            let c = z_i[2] * F::from(4_u32);
+            let d = z_i[3] * F::from(40_u32);
+            let e = z_i[4] + F::from(100_u32);
+
+            Ok(vec![a, b, c, d, e])
+        }
+
         /// generates the constraints for the step of F for the given z_i
         fn generate_step_constraints(
             &self,
             cs: ConstraintSystemRef<F>,
             _i: usize,
             z_i: Vec<FpVar<F>>,
-            _external_inputs: Self::ExternalInputsVar,
+            _external_inputs: Vec<FpVar<F>>,
         ) -> Result<Vec<FpVar<F>>, SynthesisError> {
             let four = FpVar::<F>::new_constant(cs.clone(), F::from(4u32))?;
             let forty = FpVar::<F>::new_constant(cs.clone(), F::from(40u32))?;
@@ -303,53 +342,16 @@ mod tests {
                 f_circuit.clone(),
             );
         let nova_params = NOVA::preprocess(&mut rng, &prep_param).unwrap();
-        let decider_params =
-            DECIDER::<FC>::preprocess(&mut rng, (nova_params.clone(), f_circuit.state_len()))
-                .unwrap();
-
-        (nova_params, decider_params)
-    }
-
-    fn interact_with_contract<'a, FC: FCircuit<Fr>>(
-        nova_cyclefold_verifier_bytecode: &[u8],
-        nova: &NOVA<FC>,
-        proof: &Proof<G1Projective, KZG<Bn254>, Groth16<Bn254>>,
-        mode: NovaVerificationMode,
-    ) {
-        let mut evm = Evm::default();
-        let verifier_address = evm.create(nova_cyclefold_verifier_bytecode.to_vec());
-
-        let calldata: Vec<u8> = prepare_calldata_for_nova_cyclefold_verifier(
-            mode,
-            nova.i,
-            nova.z_0.clone(),
-            nova.z_i.clone(),
-            &nova.U_i,
-            &nova.u_i,
-            proof,
+        let nova = NOVA::init(
+            &nova_params,
+            f_circuit.clone(),
+            vec![Fr::zero(); f_circuit.state_len()].clone(),
         )
         .unwrap();
+        let decider_params =
+            DECIDER::preprocess(&mut rng, nova_params.clone(), nova.clone()).unwrap();
 
-        let (_, output) = evm.call(verifier_address, calldata.clone());
-        assert_eq!(*output.last().unwrap(), 1);
-
-        // change i to make calldata invalid, placed between bytes 4 - 35
-        let mut invalid_calldata = calldata.clone();
-        invalid_calldata[35] += 1;
-        let (_, output) = evm.call(verifier_address, invalid_calldata.clone());
-        assert_eq!(*output.last().unwrap(), 0);
-
-        // change z_0 to make the EVM check fail, placed between bytes 35 - 67
-        let mut invalid_calldata = calldata.clone();
-        invalid_calldata[67] += 1;
-        let (_, output) = evm.call(verifier_address, invalid_calldata.clone());
-        assert_eq!(*output.last().unwrap(), 0);
-
-        // change z_i to make the EVM check fail, placed between bytes 68 - 100
-        let mut invalid_calldata = calldata.clone();
-        invalid_calldata[99] += 1;
-        let (_, output) = evm.call(verifier_address, invalid_calldata.clone());
-        assert_eq!(*output.last().unwrap(), 0);
+        (nova_params, decider_params)
     }
 
     /// This function allows to define which FCircuit to use for the test, and how many prove_step
@@ -377,8 +379,7 @@ mod tests {
 
         let mut nova = NOVA::<FC>::init(&fs_params, f_circuit, z_0).unwrap();
         for _ in 0..n_steps {
-            nova.prove_step(&mut rng, FC::ExternalInputs::default(), None)
-                .unwrap();
+            nova.prove_step(&mut rng, vec![], None).unwrap();
         }
 
         let start = Instant::now();
@@ -397,37 +398,86 @@ mod tests {
         .unwrap();
         assert!(verified);
 
+        let function_selector =
+            get_function_selector_for_nova_cyclefold_verifier(nova.z_0.len() * 2 + 1);
+
+        let calldata: Vec<u8> = prepare_calldata(
+            function_selector,
+            nova.i,
+            nova.z_0,
+            nova.z_i,
+            &nova.U_i,
+            &nova.u_i,
+            proof,
+        )
+        .unwrap();
+
         let decider_solidity_code = get_decider_template_for_cyclefold_decider(nova_cyclefold_vk);
 
         let nova_cyclefold_verifier_bytecode =
             compile_solidity(decider_solidity_code, "NovaDecider");
 
-        for mode in [Explicit, Opaque, OpaqueWithInputs] {
-            interact_with_contract(&nova_cyclefold_verifier_bytecode, &nova, &proof, mode);
-        }
-    }
+        let mut evm = Evm::default();
+        let verifier_address = evm.create(nova_cyclefold_verifier_bytecode);
 
-    /// Given an `FCircuit` type and initial IVC state `z_0`, this function tests the `NovaCycleFold`
-    /// verifier with a few different folding steps.
-    fn nova_cyclefold_solidity_verifier_test<FC: FCircuit<Fr, Params = ()>>(z_0: Vec<Fr>) {
-        let (nova_params, decider_params) = init_params::<FC>();
-        for num_steps in [2, 3] {
-            nova_cyclefold_solidity_verifier_opt::<FC>(
-                nova_params.clone(),
-                decider_params.clone(),
-                z_0.clone(),
-                num_steps,
-            )
-        }
+        let (_, output) = evm.call(verifier_address, calldata.clone());
+        assert_eq!(*output.last().unwrap(), 1);
+
+        // change i to make calldata invalid, placed between bytes 4 - 35
+        let mut invalid_calldata = calldata.clone();
+        invalid_calldata[35] += 1;
+        let (_, output) = evm.call(verifier_address, invalid_calldata.clone());
+        assert_eq!(*output.last().unwrap(), 0);
+
+        // change z_0 to make the EVM check fail, placed between bytes 35 - 67
+        let mut invalid_calldata = calldata.clone();
+        invalid_calldata[67] += 1;
+        let (_, output) = evm.call(verifier_address, invalid_calldata.clone());
+        assert_eq!(*output.last().unwrap(), 0);
+
+        // change z_i to make the EVM check fail, placed between bytes 68 - 100
+        let mut invalid_calldata = calldata.clone();
+        invalid_calldata[99] += 1;
+        let (_, output) = evm.call(verifier_address, invalid_calldata.clone());
+        assert_eq!(*output.last().unwrap(), 0);
     }
 
     #[test]
-    fn nova_cyclefold_solidity_verifier_single_input() {
-        nova_cyclefold_solidity_verifier_test::<CubicFCircuit<Fr>>(vec![Fr::from(3_u32)]);
-    }
+    fn nova_cyclefold_solidity_verifier() {
+        let (nova_params, decider_params) = init_params::<CubicFCircuit<Fr>>();
+        let z_0 = vec![Fr::from(3_u32)];
+        nova_cyclefold_solidity_verifier_opt::<CubicFCircuit<Fr>>(
+            nova_params.clone(),
+            decider_params.clone(),
+            z_0.clone(),
+            2,
+        );
+        nova_cyclefold_solidity_verifier_opt::<CubicFCircuit<Fr>>(
+            nova_params,
+            decider_params,
+            z_0,
+            3,
+        );
 
-    #[test]
-    fn nova_cyclefold_solidity_verifier_multi_input() {
-        nova_cyclefold_solidity_verifier_test::<MultiInputsFCircuit<Fr>>(vec![Fr::from(1_u32); 5]);
+        let (nova_params, decider_params) = init_params::<MultiInputsFCircuit<Fr>>();
+        let z_0 = vec![
+            Fr::from(1_u32),
+            Fr::from(1_u32),
+            Fr::from(1_u32),
+            Fr::from(1_u32),
+            Fr::from(1_u32),
+        ];
+        nova_cyclefold_solidity_verifier_opt::<MultiInputsFCircuit<Fr>>(
+            nova_params.clone(),
+            decider_params.clone(),
+            z_0.clone(),
+            2,
+        );
+        nova_cyclefold_solidity_verifier_opt::<MultiInputsFCircuit<Fr>>(
+            nova_params,
+            decider_params,
+            z_0.clone(),
+            3,
+        );
     }
 }

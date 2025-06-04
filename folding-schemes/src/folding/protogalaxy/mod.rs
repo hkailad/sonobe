@@ -1,18 +1,19 @@
 /// Implements the scheme described in [ProtoGalaxy](https://eprint.iacr.org/2023/1106.pdf)
 use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
-    CryptographicSponge,
+    Absorb, CryptographicSponge,
 };
+use ark_ec::CurveGroup;
 use ark_ff::{BigInteger, PrimeField};
 use ark_r1cs_std::{
     alloc::{AllocVar, AllocationMode},
     eq::EqGadget,
     fields::{fp::FpVar, FieldVar},
+    groups::CurveVar,
     R1CSVar,
 };
 use ark_relations::r1cs::{
     ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, Namespace, SynthesisError,
-    SynthesisMode,
 };
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Valid};
 use ark_std::{
@@ -24,7 +25,7 @@ use num_bigint::BigUint;
 use crate::{
     arith::{
         r1cs::{extract_r1cs, extract_w_x, R1CS},
-        Arith, ArithRelation,
+        Arith,
     },
     commitment::CommitmentScheme,
     folding::circuits::{
@@ -33,12 +34,12 @@ use crate::{
             CycleFoldWitness,
         },
         nonnative::affine::NonNativeAffineVar,
-        CF1,
+        CF1, CF2,
     },
     frontend::{utils::DummyCircuit, FCircuit},
     transcript::poseidon::poseidon_canonical_config,
-    utils::pp_hash,
-    Curve, Error, FoldingScheme,
+    utils::{get_cm_coordinates, pp_hash},
+    Error, FoldingScheme,
 };
 
 pub mod circuits;
@@ -57,11 +58,11 @@ use super::traits::{
 };
 
 /// Configuration for ProtoGalaxy's CycleFold circuit
-pub struct ProtoGalaxyCycleFoldConfig<C: Curve> {
+pub struct ProtoGalaxyCycleFoldConfig<C: CurveGroup> {
     _c: PhantomData<C>,
 }
 
-impl<C: Curve> CycleFoldConfig for ProtoGalaxyCycleFoldConfig<C> {
+impl<C: CurveGroup> CycleFoldConfig for ProtoGalaxyCycleFoldConfig<C> {
     const RANDOMNESS_BIT_LENGTH: usize = C::ScalarField::MODULUS_BIT_SIZE as usize;
     const N_INPUT_POINTS: usize = 2;
     type C = C;
@@ -69,7 +70,7 @@ impl<C: Curve> CycleFoldConfig for ProtoGalaxyCycleFoldConfig<C> {
 
 /// CycleFold circuit for computing random linear combinations of group elements
 /// in ProtoGalaxy instances.
-pub type ProtoGalaxyCycleFoldCircuit<C> = CycleFoldCircuit<ProtoGalaxyCycleFoldConfig<C>>;
+pub type ProtoGalaxyCycleFoldCircuit<C, GC> = CycleFoldCircuit<ProtoGalaxyCycleFoldConfig<C>, GC>;
 
 /// The committed instance of ProtoGalaxy.
 ///
@@ -77,14 +78,14 @@ pub type ProtoGalaxyCycleFoldCircuit<C> = CycleFoldCircuit<ProtoGalaxyCycleFoldC
 /// they have slightly different structures (e.g., length of `betas`) and
 /// behaviors (e.g., in satisfiability checks).
 #[derive(Clone, Debug, PartialEq, Eq, CanonicalSerialize, CanonicalDeserialize)]
-pub struct CommittedInstance<C: Curve, const TYPE: bool> {
+pub struct CommittedInstance<C: CurveGroup, const TYPE: bool> {
     phi: C,
     betas: Vec<C::ScalarField>,
     e: C::ScalarField,
     x: Vec<C::ScalarField>,
 }
 
-impl<C: Curve, const TYPE: bool> Dummy<(usize, usize)> for CommittedInstance<C, TYPE> {
+impl<C: CurveGroup, const TYPE: bool> Dummy<(usize, usize)> for CommittedInstance<C, TYPE> {
     fn dummy((io_len, t): (usize, usize)) -> Self {
         if TYPE == INCOMING {
             assert_eq!(t, 0);
@@ -98,18 +99,18 @@ impl<C: Curve, const TYPE: bool> Dummy<(usize, usize)> for CommittedInstance<C, 
     }
 }
 
-impl<C: Curve, const TYPE: bool> Dummy<&R1CS<CF1<C>>> for CommittedInstance<C, TYPE> {
+impl<C: CurveGroup, const TYPE: bool> Dummy<&R1CS<CF1<C>>> for CommittedInstance<C, TYPE> {
     fn dummy(r1cs: &R1CS<CF1<C>>) -> Self {
         let t = if TYPE == RUNNING {
-            log2(r1cs.n_constraints()) as usize
+            log2(r1cs.num_constraints()) as usize
         } else {
             0
         };
-        Self::dummy((r1cs.n_public_inputs(), t))
+        Self::dummy((r1cs.num_public_inputs(), t))
     }
 }
 
-impl<C: Curve, const TYPE: bool> CommittedInstanceOps<C> for CommittedInstance<C, TYPE> {
+impl<C: CurveGroup, const TYPE: bool> CommittedInstanceOps<C> for CommittedInstance<C, TYPE> {
     type Var = CommittedInstanceVar<C, TYPE>;
 
     fn get_commitments(&self) -> Vec<C> {
@@ -121,29 +122,23 @@ impl<C: Curve, const TYPE: bool> CommittedInstanceOps<C> for CommittedInstance<C
     }
 }
 
-impl<C: Curve, const TYPE: bool> Inputize<CF1<C>> for CommittedInstance<C, TYPE> {
-    /// Returns the internal representation in the same order as how the value
-    /// is allocated in `CommittedInstanceVar::new_input`.
-    fn inputize(&self) -> Vec<CF1<C>> {
-        [
-            &self.phi.inputize_nonnative(),
-            &self.betas,
-            &[self.e][..],
-            &self.x,
-        ]
-        .concat()
+impl<C: CurveGroup, const TYPE: bool> Inputize<C::ScalarField, CommittedInstanceVar<C, TYPE>>
+    for CommittedInstance<C, TYPE>
+{
+    fn inputize(&self) -> Vec<C::ScalarField> {
+        [&self.phi.inputize(), &self.betas, &[self.e][..], &self.x].concat()
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct CommittedInstanceVar<C: Curve, const TYPE: bool> {
+pub struct CommittedInstanceVar<C: CurveGroup, const TYPE: bool> {
     phi: NonNativeAffineVar<C>,
     betas: Vec<FpVar<C::ScalarField>>,
     e: FpVar<C::ScalarField>,
     x: Vec<FpVar<C::ScalarField>>,
 }
 
-impl<C: Curve, const TYPE: bool> AllocVar<CommittedInstance<C, TYPE>, C::ScalarField>
+impl<C: CurveGroup, const TYPE: bool> AllocVar<CommittedInstance<C, TYPE>, C::ScalarField>
     for CommittedInstanceVar<C, TYPE>
 {
     fn new_variable<T: Borrow<CommittedInstance<C, TYPE>>>(
@@ -170,7 +165,7 @@ impl<C: Curve, const TYPE: bool> AllocVar<CommittedInstance<C, TYPE>, C::ScalarF
     }
 }
 
-impl<C: Curve, const TYPE: bool> R1CSVar<C::ScalarField> for CommittedInstanceVar<C, TYPE> {
+impl<C: CurveGroup, const TYPE: bool> R1CSVar<C::ScalarField> for CommittedInstanceVar<C, TYPE> {
     type Value = CommittedInstance<C, TYPE>;
 
     fn cs(&self) -> ConstraintSystemRef<C::ScalarField> {
@@ -195,7 +190,7 @@ impl<C: Curve, const TYPE: bool> R1CSVar<C::ScalarField> for CommittedInstanceVa
     }
 }
 
-impl<C: Curve, const TYPE: bool> CommittedInstanceVarOps<C> for CommittedInstanceVar<C, TYPE> {
+impl<C: CurveGroup, const TYPE: bool> CommittedInstanceVarOps<C> for CommittedInstanceVar<C, TYPE> {
     type PointVar = NonNativeAffineVar<C>;
 
     fn get_commitments(&self) -> Vec<Self::PointVar> {
@@ -237,7 +232,7 @@ impl<F: PrimeField> Witness<F> {
         Self { w, r_w: F::zero() }
     }
 
-    pub fn commit<CS: CommitmentScheme<C>, C: Curve<ScalarField = F>>(
+    pub fn commit<CS: CommitmentScheme<C>, C: CurveGroup<ScalarField = F>>(
         &self,
         params: &CS::ProverParams,
         x: Vec<F>,
@@ -255,7 +250,7 @@ impl<F: PrimeField> Witness<F> {
 impl<F: PrimeField> Dummy<&R1CS<F>> for Witness<F> {
     fn dummy(r1cs: &R1CS<F>) -> Self {
         Self {
-            w: vec![F::zero(); r1cs.n_witnesses()],
+            w: vec![F::zero(); r1cs.num_witnesses()],
             r_w: F::zero(),
         }
     }
@@ -317,8 +312,8 @@ pub enum ProtoGalaxyError {
 #[derive(Debug, Clone)]
 pub struct ProverParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
@@ -331,8 +326,8 @@ where
 }
 impl<C1, C2, CS1, CS2> CanonicalSerialize for ProverParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1, false>,
     CS2: CommitmentScheme<C2, false>,
 {
@@ -351,8 +346,8 @@ where
 }
 impl<C1, C2, CS1, CS2> Valid for ProverParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
@@ -371,8 +366,8 @@ where
 }
 impl<C1, C2, CS1, CS2> CanonicalDeserialize for ProverParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1, false>,
     CS2: CommitmentScheme<C2, false>,
 {
@@ -396,8 +391,8 @@ where
 #[derive(Debug, Clone)]
 pub struct VerifierParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
@@ -415,8 +410,8 @@ where
 
 impl<C1, C2, CS1, CS2> Valid for VerifierParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
@@ -428,8 +423,8 @@ where
 }
 impl<C1, C2, CS1, CS2> CanonicalSerialize for VerifierParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
@@ -449,15 +444,16 @@ where
 
 impl<C1, C2, CS1, CS2> VerifierParams<C1, C2, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
     /// returns the hash of the public parameters of ProtoGalaxy
     pub fn pp_hash(&self) -> Result<C1::ScalarField, Error> {
-        // TODO: support hiding commitments in ProtoGalaxy. For now, `H` is set to false. Tracking
-        // issue: https://github.com/privacy-scaling-explorations/sonobe/issues/82
+        // TODO (@winderica): support hiding commitments in ProtoGalaxy.
+        // For now, `H` is set to false.
+        // Tracking issue: https://github.com/privacy-scaling-explorations/sonobe/issues/82
         pp_hash::<C1, C2, CS1, CS2, false>(
             &self.r1cs,
             &self.cf_r1cs,
@@ -469,7 +465,11 @@ where
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
-pub struct IVCProof<C1: Curve, C2: Curve> {
+pub struct IVCProof<C1, C2>
+where
+    C1: CurveGroup,
+    C2: CurveGroup,
+{
     pub i: C1::ScalarField,
     pub z_0: Vec<C1::ScalarField>,
     pub z_i: Vec<C1::ScalarField>,
@@ -487,14 +487,19 @@ pub struct IVCProof<C1: Curve, C2: Curve> {
 /// [ProtoGalaxy]: https://eprint.iacr.org/2023/1106.pdf
 /// [CycleFold]: https://eprint.iacr.org/2023/1192.pdf
 #[derive(Clone, Debug)]
-pub struct ProtoGalaxy<C1, C2, FC, CS1, CS2>
+pub struct ProtoGalaxy<C1, GC1, C2, GC2, FC, CS1, CS2>
 where
-    C1: Curve,
-    C2: Curve,
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF2<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
     FC: FCircuit<C1::ScalarField>,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
 {
+    _gc1: PhantomData<GC1>,
+    _c2: PhantomData<C2>,
+    _gc2: PhantomData<GC2>,
     /// R1CS of the Augmented Function circuit
     pub r1cs: R1CS<C1::ScalarField>,
     /// R1CS of the CycleFold circuit
@@ -524,13 +529,20 @@ where
     pub cf_U_i: CycleFoldCommittedInstance<C2>,
 }
 
-impl<C1, C2, FC, CS1, CS2> ProtoGalaxy<C1, C2, FC, CS1, CS2>
+impl<C1, GC1, C2, GC2, FC, CS1, CS2> ProtoGalaxy<C1, GC1, C2, GC2, FC, CS1, CS2>
 where
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF2<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
     FC: FCircuit<C1::ScalarField>,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
+    <C1 as CurveGroup>::BaseField: PrimeField,
+    <C2 as CurveGroup>::BaseField: PrimeField,
+    C1::ScalarField: Absorb,
+    C2::ScalarField: Absorb,
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
 {
     /// This method computes the parameter `t` in ProtoGalaxy for folding `F'`,
     /// the augmented circuit of `F`
@@ -557,6 +569,7 @@ where
         // For `t_lower_bound`, we configure `F'` with `t = 1` and compute log2
         // of the size of `F'`.
         let state_len = F.state_len();
+        let external_inputs_len = F.external_inputs_len();
 
         // `F'` includes `F` and `ProtoGalaxy.V`, where `F` might be costly.
         // Observing that the cost of `F` is constant with respect to `t`, we
@@ -564,23 +577,22 @@ where
         // Later, we only need to re-run the rest of `F'` with updated `t` to
         // get the size of `F'`.
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
         F.generate_step_constraints(
             cs.clone(),
             0,
             Vec::new_witness(cs.clone(), || Ok(vec![Zero::zero(); state_len]))?,
-            FC::ExternalInputsVar::new_witness(cs.clone(), || Ok(FC::ExternalInputs::default()))?,
+            Vec::new_witness(cs.clone(), || Ok(vec![Zero::zero(); external_inputs_len]))?,
         )?;
         let step_constraints = cs.num_constraints();
 
         // Create a dummy circuit with the same state length and external inputs
         // length as `F`, which replaces `F` in the augmented circuit `F'`.
-        let dummy_circuit: DummyCircuit = FCircuit::<C1::ScalarField>::new(state_len)?;
+        let dummy_circuit: DummyCircuit =
+            FCircuit::<C1::ScalarField>::new((state_len, external_inputs_len))?;
 
         // Compute `augmentation_constraints`, the size of `F'` without `F`.
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
-        AugmentedFCircuit::<C1, C2, DummyCircuit>::empty(
+        AugmentedFCircuit::<C1, C2, GC2, DummyCircuit>::empty(
             poseidon_config,
             dummy_circuit.clone(),
             1,
@@ -603,8 +615,7 @@ where
 
         for t in t_lower_bound..=t_upper_bound {
             let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-            cs.set_mode(SynthesisMode::Setup);
-            AugmentedFCircuit::<C1, C2, DummyCircuit>::empty(
+            AugmentedFCircuit::<C1, C2, GC2, DummyCircuit>::empty(
                 poseidon_config,
                 dummy_circuit.clone(),
                 t,
@@ -621,13 +632,21 @@ where
     }
 }
 
-impl<C1, C2, FC, CS1, CS2> FoldingScheme<C1, C2, FC> for ProtoGalaxy<C1, C2, FC, CS1, CS2>
+impl<C1, GC1, C2, GC2, FC, CS1, CS2> FoldingScheme<C1, C2, FC>
+    for ProtoGalaxy<C1, GC1, C2, GC2, FC, CS1, CS2>
 where
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF2<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
     FC: FCircuit<C1::ScalarField>,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
+    <C1 as CurveGroup>::BaseField: PrimeField,
+    <C2 as CurveGroup>::BaseField: PrimeField,
+    C1::ScalarField: Absorb,
+    C2::ScalarField: Absorb,
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
 {
     type PreprocessorParam = (PoseidonConfig<CF1<C1>>, FC);
     type ProverParam = ProverParams<C1, C2, CS1, CS2>;
@@ -663,14 +682,18 @@ where
 
         let f_circuit = FC::new(fc_params)?;
         let k = 1;
-        let d = R1CS::<CF1<C1>>::empty().degree();
+        let d = 2;
         let t = Self::compute_t(&poseidon_config, &f_circuit, d, k)?;
 
         // main circuit R1CS:
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
-        let augmented_F_circuit =
-            AugmentedFCircuit::<C1, C2, FC>::empty(&poseidon_config, f_circuit.clone(), t, d, k);
+        let augmented_F_circuit = AugmentedFCircuit::<C1, C2, GC2, FC>::empty(
+            &poseidon_config,
+            f_circuit.clone(),
+            t,
+            d,
+            k,
+        );
         augmented_F_circuit.generate_constraints(cs.clone())?;
         cs.finalize();
         let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
@@ -678,8 +701,7 @@ where
 
         // CycleFold circuit R1CS
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
-        cs2.set_mode(SynthesisMode::Setup);
-        let cf_circuit = ProtoGalaxyCycleFoldCircuit::<C1>::empty();
+        let cf_circuit = ProtoGalaxyCycleFoldCircuit::<C1, GC1>::empty();
         cf_circuit.generate_constraints(cs2.clone())?;
         cs2.finalize();
         let cs2 = cs2.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
@@ -703,22 +725,22 @@ where
     ) -> Result<(Self::ProverParam, Self::VerifierParam), Error> {
         // We fix `k`, the number of incoming instances, to 1, because
         // multi-instances folding is not supported yet.
-        // TODO: Support multi-instances folding and make `k` a constant generic parameter (as in
-        // HyperNova). Tracking issue:
-        // https://github.com/privacy-scaling-explorations/sonobe/issues/82
+        // TODO (@winderica): Support multi-instances folding and make `k` a
+        // constant generic parameter (as in HyperNova)
+        // Tracking issue: https://github.com/privacy-scaling-explorations/sonobe/issues/82
         let k = 1;
-        let d = R1CS::<CF1<C1>>::empty().degree();
+        // `d`, the degree of the constraint system, is set to 2, as we only
+        // support R1CS for now, whose highest degree is 2.
+        let d = 2;
         let t = Self::compute_t(poseidon_config, F, d, k)?;
 
         // prepare the circuit to obtain its R1CS
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
-        cs2.set_mode(SynthesisMode::Setup);
 
         let augmented_F_circuit =
-            AugmentedFCircuit::<C1, C2, FC>::empty(poseidon_config, F.clone(), t, d, k);
-        let cf_circuit = ProtoGalaxyCycleFoldCircuit::<C1>::empty();
+            AugmentedFCircuit::<C1, C2, GC2, FC>::empty(poseidon_config, F.clone(), t, d, k);
+        let cf_circuit = ProtoGalaxyCycleFoldCircuit::<C1, GC1>::empty();
 
         augmented_F_circuit.generate_constraints(cs.clone())?;
         cs.finalize();
@@ -730,16 +752,8 @@ where
         let cs2 = cs2.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
         let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2)?;
 
-        // `CS1` is for committing to ProtoGalaxy's witness vector `w`, so we
-        // set `len` to the number of witnesses in `r1cs`.
-        let (cs_pp, cs_vp) = CS1::setup(&mut rng, r1cs.n_witnesses())?;
-        // `CS2` is for committing to CycleFold's witness vector `w` and error
-        // term `e`, where the length of `e` is the number of constraints, so we
-        // set `len` to the maximum of `e` and `w`'s lengths.
-        let (cf_cs_pp, cf_cs_vp) = CS2::setup(
-            &mut rng,
-            max(cf_r1cs.n_constraints(), cf_r1cs.n_witnesses()),
-        )?;
+        let (cs_pp, cs_vp) = CS1::setup(&mut rng, r1cs.A.n_rows)?;
+        let (cf_cs_pp, cf_cs_vp) = CS2::setup(&mut rng, max(cf_r1cs.A.n_rows, cf_r1cs.A.n_cols))?;
 
         Ok((
             Self::ProverParam {
@@ -775,6 +789,9 @@ where
         // W_dummy=W_0 is a 'dummy witness', all zeroes, but with the size corresponding to the
         // R1CS that we're working with.
         Ok(Self {
+            _gc1: PhantomData,
+            _c2: PhantomData,
+            _gc2: PhantomData,
             r1cs: vp.r1cs.clone(),
             cf_r1cs: vp.cf_r1cs.clone(),
             poseidon_config: pp.poseidon_config.clone(),
@@ -799,7 +816,7 @@ where
     fn prove_step(
         &mut self,
         mut rng: impl RngCore,
-        external_inputs: FC::ExternalInputs,
+        external_inputs: Vec<C1::ScalarField>,
         _other_instances: Option<Self::MultiCommittedInstanceWithWitness>,
     ) -> Result<(), Error> {
         // Multi-instances folding is not supported yet.
@@ -808,18 +825,20 @@ where
         }
         // We fix `k`, the number of incoming instances, to 1, because
         // multi-instances folding is not supported yet.
-        // TODO: Support multi-instances folding and make `k` a constant generic parameter (as in
-        // HyperNova). Tracking issue:
-        // https://github.com/privacy-scaling-explorations/sonobe/issues/82
+        // TODO (@winderica): Support multi-instances folding and make `k` a
+        // constant generic parameter (as in HyperNova)
+        // Tracking issue: https://github.com/privacy-scaling-explorations/sonobe/issues/82
         let k = 1;
-        let d = self.r1cs.degree();
+        // `d`, the degree of the constraint system, is set to 2, as we only
+        // support R1CS for now, whose highest degree is 2.
+        let d = 2;
 
         // `sponge` is for digest computation.
         let sponge = PoseidonSponge::<C1::ScalarField>::new(&self.poseidon_config);
         // `transcript` is for challenge generation.
         let mut transcript_prover = sponge.clone();
 
-        let mut augmented_F_circuit: AugmentedFCircuit<C1, C2, FC>;
+        let mut augmented_F_circuit: AugmentedFCircuit<C1, C2, GC2, FC>;
 
         if self.z_i.len() != self.F.state_len() {
             return Err(Error::NotSameLength(
@@ -829,11 +848,43 @@ where
                 self.F.state_len(),
             ));
         }
+        if external_inputs.len() != self.F.external_inputs_len() {
+            return Err(Error::NotSameLength(
+                "F.external_inputs_len()".to_string(),
+                self.F.external_inputs_len(),
+                "external_inputs.len()".to_string(),
+                external_inputs.len(),
+            ));
+        }
 
         let i_bn: BigUint = self.i.into();
         let i_usize: usize = i_bn.try_into().map_err(|_| Error::MaxStep)?;
 
+        let z_i1 = self
+            .F
+            .step_native(i_usize, self.z_i.clone(), external_inputs.clone())?;
+
+        // folded instance output (public input, x)
+        // u_{i+1}.x[0] = H(i+1, z_0, z_{i+1}, U_{i+1})
+        let u_i1_x: C1::ScalarField;
+        // u_{i+1}.x[1] = H(cf_U_{i+1})
+        let cf_u_i1_x: C1::ScalarField;
+
         if self.i.is_zero() {
+            // Take extra care of the base case
+            // `U_{i+1}` (i.e., `U_1`) is fixed to `U_dummy`, so we just use
+            // `self.U_i = U_0 = U_dummy`.
+            u_i1_x = self.U_i.hash(
+                &sponge,
+                self.pp_hash,
+                self.i + C1::ScalarField::one(),
+                &self.z_0,
+                &z_i1,
+            );
+            // `cf_U_{i+1}` (i.e., `cf_U_1`) is fixed to `cf_U_dummy`, so we
+            // just use `self.cf_U_i = cf_U_0 = cf_U_dummy`.
+            cf_u_i1_x = self.cf_U_i.hash_cyclefold(&sponge, self.pp_hash);
+
             augmented_F_circuit = AugmentedFCircuit::empty(
                 &self.poseidon_config,
                 self.F.clone(),
@@ -848,7 +899,7 @@ where
                 .external_inputs
                 .clone_from(&external_inputs);
 
-        // There is no need to update `self.U_i` etc. as they are unchanged.
+            // There is no need to update `self.U_i` etc. as they are unchanged.
         } else {
             // Primary part:
             // Compute `U_{i+1}` by folding `u_i` into `U_i`.
@@ -862,6 +913,7 @@ where
             )?;
 
             // CycleFold part:
+            // get the vector used as public inputs 'x' in the CycleFold circuit
             let mut r0_bits = aux.L_X_evals[0].into_bigint().to_bits_le();
             let mut r1_bits = aux.L_X_evals[1].into_bigint().to_bits_le();
             r0_bits.resize(C1::ScalarField::MODULUS_BIT_SIZE as usize, false);
@@ -869,37 +921,76 @@ where
 
             // cyclefold circuit for enforcing:
             // 0 + U_i.phi * L_evals[0] == phi_stars[0]
-            let cf1_circuit = ProtoGalaxyCycleFoldCircuit::<C1> {
+            let cf1_u_i_x = [
+                r0_bits
+                    .chunks(C1::BaseField::MODULUS_BIT_SIZE as usize - 1)
+                    .map(<C1::BaseField as PrimeField>::BigInt::from_bits_le)
+                    .map(C1::BaseField::from)
+                    .collect::<Vec<_>>(),
+                get_cm_coordinates(&C1::zero()),
+                get_cm_coordinates(&self.U_i.phi),
+                get_cm_coordinates(&aux.phi_stars[0]),
+            ]
+            .concat();
+            let cf1_circuit = ProtoGalaxyCycleFoldCircuit::<C1, GC1> {
+                _gc: PhantomData,
                 r_bits: Some(r0_bits),
                 points: Some(vec![C1::zero(), self.U_i.phi]),
+                x: Some(cf1_u_i_x.clone()),
             };
 
             // cyclefold circuit for enforcing:
             // phi_stars[0] + u_i.phi * L_evals[1] == U_i1.phi
             // i.e., U_i.phi * L_evals[0] + u_i.phi * L_evals[1] == U_i1.phi
-            let cf2_circuit = ProtoGalaxyCycleFoldCircuit::<C1> {
+            let cf2_u_i_x = [
+                r1_bits
+                    .chunks(C1::BaseField::MODULUS_BIT_SIZE as usize - 1)
+                    .map(<C1::BaseField as PrimeField>::BigInt::from_bits_le)
+                    .map(C1::BaseField::from)
+                    .collect::<Vec<_>>(),
+                get_cm_coordinates(&aux.phi_stars[0]),
+                get_cm_coordinates(&self.u_i.phi),
+                get_cm_coordinates(&U_i1.phi),
+            ]
+            .concat();
+            let cf2_circuit = ProtoGalaxyCycleFoldCircuit::<C1, GC1> {
+                _gc: PhantomData,
                 r_bits: Some(r1_bits),
                 points: Some(vec![aux.phi_stars[0], self.u_i.phi]),
+                x: Some(cf2_u_i_x.clone()),
             };
 
             // fold self.cf_U_i + cf1_U -> folded running with cf1
-            let (cf1_u_i, cf1_W_i1, cf1_U_i1, cf1_cmT) = self.fold_cyclefold_circuit(
+            let (_cf1_w_i, cf1_u_i, cf1_W_i1, cf1_U_i1, cf1_cmT, _) = self.fold_cyclefold_circuit(
                 &mut transcript_prover,
                 self.cf_W_i.clone(), // CycleFold running instance witness
                 self.cf_U_i.clone(), // CycleFold running instance
+                cf1_u_i_x,
                 cf1_circuit,
                 &mut rng,
             )?;
             // fold [the output from folding self.cf_U_i + cf1_U] + cf2_U = folded_running_with_cf1 + cf2
-            let (cf2_u_i, cf_W_i1, cf_U_i1, cf2_cmT) = self.fold_cyclefold_circuit(
+            let (_cf2_w_i, cf2_u_i, cf_W_i1, cf_U_i1, cf2_cmT, _) = self.fold_cyclefold_circuit(
                 &mut transcript_prover,
                 cf1_W_i1,
                 cf1_U_i1.clone(),
+                cf2_u_i_x,
                 cf2_circuit,
                 &mut rng,
             )?;
 
+            // Derive `u_{i+1}.x[0], u_{i+1}.x[1]` by hashing folded instances
+            u_i1_x = U_i1.hash(
+                &sponge,
+                self.pp_hash,
+                self.i + C1::ScalarField::one(),
+                &self.z_0,
+                &z_i1,
+            );
+            cf_u_i1_x = cf_U_i1.hash_cyclefold(&sponge, self.pp_hash);
+
             augmented_F_circuit = AugmentedFCircuit {
+                _gc2: PhantomData,
                 poseidon_config: self.poseidon_config.clone(),
                 pp_hash: self.pp_hash,
                 i: self.i,
@@ -914,12 +1005,14 @@ where
                 K_coeffs: proof.K_coeffs.clone(),
                 phi_stars: aux.phi_stars,
                 F: self.F.clone(),
+                x: Some(u_i1_x),
                 // cyclefold values
                 cf1_u_i_cmW: cf1_u_i.cmW,
                 cf2_u_i_cmW: cf2_u_i.cmW,
                 cf_U_i: self.cf_U_i.clone(),
                 cf1_cmT,
                 cf2_cmT,
+                cf_x: Some(cf_u_i1_x),
             };
 
             #[cfg(test)]
@@ -934,6 +1027,11 @@ where
                     )?,
                     U_i1
                 );
+                cf1_u_i.check_incoming()?;
+                cf2_u_i.check_incoming()?;
+                self.cf_r1cs.check_relation(&_cf1_w_i, &cf1_u_i)?;
+                self.cf_r1cs.check_relation(&_cf2_w_i, &cf2_u_i)?;
+                self.cf_r1cs.check_relation(&self.cf_W_i, &self.cf_U_i)?;
             }
 
             self.W_i = W_i1;
@@ -944,15 +1042,16 @@ where
 
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
 
-        let z_i1 = augmented_F_circuit
-            .compute_next_state(cs.clone())?
-            .value()?;
+        augmented_F_circuit.generate_constraints(cs.clone())?;
 
         #[cfg(test)]
         assert!(cs.is_satisfied()?);
 
         let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
         let (w_i1, x_i1) = extract_w_x::<C1::ScalarField>(&cs);
+        if x_i1[0] != u_i1_x || x_i1[1] != cf_u_i1_x {
+            return Err(Error::NotEqual);
+        }
 
         #[cfg(test)]
         if x_i1.len() != 2 {
@@ -1014,6 +1113,9 @@ where
         let f_circuit = FC::new(fcircuit_params)?;
 
         Ok(Self {
+            _gc1: PhantomData,
+            _c2: PhantomData,
+            _gc2: PhantomData,
             r1cs: vp.r1cs.clone(),
             cf_r1cs: vp.cf_r1cs.clone(),
             poseidon_config: pp.poseidon_config,
@@ -1081,13 +1183,20 @@ where
     }
 }
 
-impl<C1, C2, FC, CS1, CS2> ProtoGalaxy<C1, C2, FC, CS1, CS2>
+impl<C1, GC1, C2, GC2, FC, CS1, CS2> ProtoGalaxy<C1, GC1, C2, GC2, FC, CS1, CS2>
 where
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF2<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
     FC: FCircuit<C1::ScalarField>,
     CS1: CommitmentScheme<C1>,
     CS2: CommitmentScheme<C2>,
+    <C1 as CurveGroup>::BaseField: PrimeField,
+    <C2 as CurveGroup>::BaseField: PrimeField,
+    C1::ScalarField: Absorb,
+    C2::ScalarField: Absorb,
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
 {
     // folds the given cyclefold circuit and its instances
     #[allow(clippy::type_complexity)]
@@ -1096,24 +1205,28 @@ where
         transcript: &mut PoseidonSponge<C1::ScalarField>,
         cf_W_i: CycleFoldWitness<C2>, // witness of the running instance
         cf_U_i: CycleFoldCommittedInstance<C2>, // running instance
-        cf_circuit: ProtoGalaxyCycleFoldCircuit<C1>,
+        cf_u_i_x: Vec<C2::ScalarField>,
+        cf_circuit: ProtoGalaxyCycleFoldCircuit<C1, GC1>,
         rng: &mut impl RngCore,
     ) -> Result<
         (
+            CycleFoldWitness<C2>,
             CycleFoldCommittedInstance<C2>, // u_i
             CycleFoldWitness<C2>,           // W_i1
             CycleFoldCommittedInstance<C2>, // U_i1
             C2,                             // cmT
+            C2::ScalarField,                // r_Fq
         ),
         Error,
     > {
-        fold_cyclefold_circuit::<ProtoGalaxyCycleFoldConfig<C1>, C2, CS2, false>(
+        fold_cyclefold_circuit::<ProtoGalaxyCycleFoldConfig<C1>, C1, GC1, C2, GC2, CS2, false>(
             transcript,
             self.cf_r1cs.clone(),
             self.cf_cs_params.clone(),
             self.pp_hash,
             cf_W_i,
             cf_U_i,
+            cf_u_i_x,
             cf_circuit,
             rng,
         )
@@ -1124,8 +1237,8 @@ where
 mod tests {
     use super::*;
 
-    use ark_bn254::{Bn254, Fr, G1Projective as Projective};
-    use ark_grumpkin::Projective as Projective2;
+    use ark_bn254::{constraints::GVar, Bn254, Fr, G1Projective as Projective};
+    use ark_grumpkin::{constraints::GVar as GVar2, Projective as Projective2};
     use ark_std::test_rng;
     use rayon::prelude::*;
 
@@ -1159,7 +1272,8 @@ mod tests {
         poseidon_config: PoseidonConfig<Fr>,
         F_circuit: CubicFCircuit<Fr>,
     ) -> Result<(), Error> {
-        type PG<CS1, CS2> = ProtoGalaxy<Projective, Projective2, CubicFCircuit<Fr>, CS1, CS2>;
+        type PG<CS1, CS2> =
+            ProtoGalaxy<Projective, GVar, Projective2, GVar2, CubicFCircuit<Fr>, CS1, CS2>;
 
         let params = PG::<CS1, CS2>::preprocess(&mut test_rng(), &(poseidon_config, F_circuit))?;
 
@@ -1168,7 +1282,7 @@ mod tests {
 
         let num_steps: usize = 3;
         for _ in 0..num_steps {
-            protogalaxy.prove_step(&mut test_rng(), (), None)?;
+            protogalaxy.prove_step(&mut test_rng(), vec![], None)?;
         }
         assert_eq!(Fr::from(num_steps as u32), protogalaxy.i);
 
@@ -1180,33 +1294,37 @@ mod tests {
     #[ignore]
     #[test]
     fn test_t_bounds() -> Result<(), Error> {
-        let d = R1CS::<Fr>::empty().degree();
+        let d = 2;
         let k = 1;
 
         let poseidon_config = poseidon_canonical_config::<Fr>();
         for state_len in [1, 10, 100] {
-            let dummy_circuit: DummyCircuit = FCircuit::<Fr>::new(state_len)?;
+            for external_inputs_len in [1, 10, 100] {
+                let dummy_circuit: DummyCircuit =
+                    FCircuit::<Fr>::new((state_len, external_inputs_len))?;
 
-            let costs: Vec<usize> = (1..32)
-                .into_par_iter()
-                .map(|t| {
-                    let cs = ConstraintSystem::<Fr>::new_ref();
-                    AugmentedFCircuit::<Projective, Projective2, DummyCircuit>::empty(
-                        &poseidon_config,
-                        dummy_circuit.clone(),
-                        t,
-                        d,
-                        k,
-                    )
-                    .generate_constraints(cs.clone())?;
-                    Ok(cs.num_constraints())
-                })
-                .collect::<Result<Vec<usize>, Error>>()?;
+                let costs: Vec<usize> = (1..32)
+                    .into_par_iter()
+                    .map(|t| {
+                        let cs = ConstraintSystem::<Fr>::new_ref();
+                        AugmentedFCircuit::<Projective, Projective2, GVar2, DummyCircuit>::empty(
+                            &poseidon_config,
+                            dummy_circuit.clone(),
+                            t,
+                            d,
+                            k,
+                        )
+                        .generate_constraints(cs.clone())?;
+                        Ok(cs.num_constraints())
+                    })
+                    .collect::<Result<Vec<usize>, Error>>()?;
 
-            for t_lower_bound in log2(costs[0]) as usize..32 {
-                let num_constraints = (1 << t_lower_bound) - costs[0] + costs[t_lower_bound - 1];
-                let t = log2(num_constraints) as usize;
-                assert!(t == t_lower_bound || t == t_lower_bound + 1);
+                for t_lower_bound in log2(costs[0]) as usize..32 {
+                    let num_constraints =
+                        (1 << t_lower_bound) - costs[0] + costs[t_lower_bound - 1];
+                    let t = log2(num_constraints) as usize;
+                    assert!(t == t_lower_bound || t == t_lower_bound + 1);
+                }
             }
         }
         Ok(())

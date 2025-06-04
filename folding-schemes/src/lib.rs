@@ -2,26 +2,14 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 
-use ark_crypto_primitives::sponge::Absorb;
-use ark_ec::{
-    short_weierstrass::{Projective, SWCurveConfig},
-    CurveGroup,
-};
-use ark_ff::{Fp, FpConfig, PrimeField};
-use ark_r1cs_std::{
-    fields::{fp::FpVar, FieldVar},
-    groups::{curves::short_weierstrass::ProjectiveVar, CurveVar},
-};
+use ark_ec::{pairing::Pairing, CurveGroup};
+use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::{
-    fmt::Debug,
-    rand::{CryptoRng, RngCore},
-};
+use ark_std::rand::CryptoRng;
+use ark_std::{fmt::Debug, rand::RngCore};
 use thiserror::Error;
 
-use crate::folding::traits::{Inputize, InputizeNonNative};
 use crate::frontend::FCircuit;
-use crate::transcript::AbsorbNonNative;
 
 pub mod arith;
 pub mod commitment;
@@ -143,11 +131,11 @@ pub enum Error {
 ///   coordinates) are in the C1::ScalarField.
 ///
 /// In other words, C1.Fq == C2.Fr, and C1.Fr == C2.Fq.
-pub trait FoldingScheme<
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+pub trait FoldingScheme<C1: CurveGroup, C2: CurveGroup, FC>: Clone + Debug
+where
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    C2::BaseField: PrimeField,
     FC: FCircuit<C1::ScalarField>,
->: Clone + Debug
 {
     type PreprocessorParam: Debug + Clone;
     type ProverParam: Debug + Clone + CanonicalSerialize;
@@ -196,7 +184,7 @@ pub trait FoldingScheme<
     fn prove_step(
         &mut self,
         rng: impl RngCore,
-        external_inputs: FC::ExternalInputs,
+        external_inputs: Vec<C1::ScalarField>,
         other_instances: Option<Self::MultiCommittedInstanceWithWitness>,
     ) -> Result<(), Error>;
 
@@ -221,11 +209,11 @@ pub trait FoldingScheme<
 
 /// Trait with auxiliary methods for multi-folding schemes (ie. HyperNova, ProtoGalaxy, etc),
 /// allowing to create new instances for the multifold.
-pub trait MultiFolding<
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+pub trait MultiFolding<C1: CurveGroup, C2: CurveGroup, FC>: Clone + Debug
+where
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    C2::BaseField: PrimeField,
     FC: FCircuit<C1::ScalarField>,
->: Clone + Debug
 {
     type RunningInstance: Debug;
     type IncomingInstance: Debug;
@@ -236,7 +224,7 @@ pub trait MultiFolding<
         &self,
         rng: impl RngCore,
         state: Vec<C1::ScalarField>,
-        external_inputs: FC::ExternalInputs,
+        external_inputs: Vec<C1::ScalarField>,
     ) -> Result<Self::RunningInstance, Error>;
 
     /// Creates a new IncomingInstance for the given state, to be folded in the multi-folding step.
@@ -244,16 +232,18 @@ pub trait MultiFolding<
         &self,
         rng: impl RngCore,
         state: Vec<C1::ScalarField>,
-        external_inputs: FC::ExternalInputs,
+        external_inputs: Vec<C1::ScalarField>,
     ) -> Result<Self::IncomingInstance, Error>;
 }
 
 pub trait Decider<
-    C1: Curve<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    C2: Curve,
+    C1: CurveGroup,
+    C2: CurveGroup,
     FC: FCircuit<C1::ScalarField>,
     FS: FoldingScheme<C1, C2, FC>,
->
+> where
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    C2::BaseField: PrimeField,
 {
     type PreprocessorParam: Debug;
     type ProverParam: Clone;
@@ -265,6 +255,7 @@ pub trait Decider<
     fn preprocess(
         rng: impl RngCore + CryptoRng,
         prep_param: Self::PreprocessorParam,
+        fs: FS,
     ) -> Result<(Self::ProverParam, Self::VerifierParam), Error>;
 
     fn prove(
@@ -286,31 +277,21 @@ pub trait Decider<
     ) -> Result<bool, Error>;
 }
 
-/// `Field` trait is a wrapper around `PrimeField` that also includes the
-/// necessary bounds for the field to be used conveniently in folding schemes.
-pub trait Field:
-    PrimeField<BasePrimeField = Self> + Absorb + AbsorbNonNative + Inputize<Self>
+/// DeciderOnchain extends the Decider into preparing the calldata
+pub trait DeciderOnchain<E: Pairing, C1: CurveGroup, C2: CurveGroup>
+where
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    C2::BaseField: PrimeField,
 {
-    /// The in-circuit variable type for this field.
-    type Var: FieldVar<Self, Self>;
-}
+    type Proof;
+    type CommittedInstance: Clone + Debug;
 
-impl<P: FpConfig<N>, const N: usize> Field for Fp<P, N> {
-    type Var = FpVar<Self>;
-}
-
-/// `Curve` trait is a wrapper around `CurveGroup` that also includes the
-/// necessary bounds for the curve to be used conveniently in folding schemes.
-pub trait Curve:
-    CurveGroup<ScalarField: Field, BaseField: Field>
-    + AbsorbNonNative
-    + Inputize<Self::BaseField>
-    + InputizeNonNative<Self::ScalarField>
-{
-    /// The in-circuit variable type for this curve.
-    type Var: CurveVar<Self, Self::BaseField>;
-}
-
-impl<P: SWCurveConfig<ScalarField: Field, BaseField: Field>> Curve for Projective<P> {
-    type Var = ProjectiveVar<P, FpVar<P::BaseField>>;
+    fn prepare_calldata(
+        i: C1::ScalarField,
+        z_0: Vec<C1::ScalarField>,
+        z_i: Vec<C1::ScalarField>,
+        running_instance: &Self::CommittedInstance,
+        incoming_instance: &Self::CommittedInstance,
+        proof: Self::Proof,
+    ) -> Result<Vec<u8>, Error>;
 }
