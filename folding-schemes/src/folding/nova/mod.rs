@@ -319,7 +319,7 @@ where
 }
 
 /// Verification parameters for Nova-based IVC
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct VerifierParams<C1, C2, CS1, CS2, const H: bool = false>
 where
     C1: Curve,
@@ -339,39 +339,39 @@ where
     pub cf_cs_vp: CS2::VerifierParams,
 }
 
-impl<C1, C2, CS1, CS2, const H: bool> Valid for VerifierParams<C1, C2, CS1, CS2, H>
-where
-    C1: Curve,
-    C2: Curve,
-    CS1: CommitmentScheme<C1, H>,
-    CS2: CommitmentScheme<C2, H>,
-{
-    fn check(&self) -> Result<(), ark_serialize::SerializationError> {
-        self.cs_vp.check()?;
-        self.cf_cs_vp.check()?;
-        Ok(())
-    }
-}
-impl<C1, C2, CS1, CS2, const H: bool> CanonicalSerialize for VerifierParams<C1, C2, CS1, CS2, H>
-where
-    C1: Curve,
-    C2: Curve,
-    CS1: CommitmentScheme<C1, H>,
-    CS2: CommitmentScheme<C2, H>,
-{
-    fn serialize_with_mode<W: std::io::prelude::Write>(
-        &self,
-        mut writer: W,
-        compress: ark_serialize::Compress,
-    ) -> Result<(), ark_serialize::SerializationError> {
-        self.cs_vp.serialize_with_mode(&mut writer, compress)?;
-        self.cf_cs_vp.serialize_with_mode(&mut writer, compress)
-    }
-
-    fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
-        self.cs_vp.serialized_size(compress) + self.cf_cs_vp.serialized_size(compress)
-    }
-}
+// impl<C1, C2, CS1, CS2, const H: bool> Valid for VerifierParams<C1, C2, CS1, CS2, H>
+// where
+//     C1: Curve,
+//     C2: Curve,
+//     CS1: CommitmentScheme<C1, H>,
+//     CS2: CommitmentScheme<C2, H>,
+// {
+//     fn check(&self) -> Result<(), ark_serialize::SerializationError> {
+//         self.cs_vp.check()?;
+//         self.cf_cs_vp.check()?;
+//         Ok(())
+//     }
+// }
+// impl<C1, C2, CS1, CS2, const H: bool> CanonicalSerialize for VerifierParams<C1, C2, CS1, CS2, H>
+// where
+//     C1: Curve,
+//     C2: Curve,
+//     CS1: CommitmentScheme<C1, H>,
+//     CS2: CommitmentScheme<C2, H>,
+// {
+//     fn serialize_with_mode<W: std::io::prelude::Write>(
+//         &self,
+//         mut writer: W,
+//         compress: ark_serialize::Compress,
+//     ) -> Result<(), ark_serialize::SerializationError> {
+//         self.cs_vp.serialize_with_mode(&mut writer, compress)?;
+//         self.cf_cs_vp.serialize_with_mode(&mut writer, compress)
+//     }
+//
+//     fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
+//         self.cs_vp.serialized_size(compress) + self.cf_cs_vp.serialized_size(compress)
+//     }
+// }
 
 impl<C1, C2, CS1, CS2, const H: bool> VerifierParams<C1, C2, CS1, CS2, H>
 where
