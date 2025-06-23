@@ -34,6 +34,7 @@ use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
 };
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{rand::RngCore, One, Zero};
 
 use super::{
@@ -48,6 +49,7 @@ use crate::{
     Curve, Error,
 };
 
+#[derive(CanonicalSerialize, CanonicalDeserialize)]
 pub struct RandomizedIVCProof<C1: Curve, C2: Curve> {
     pub U_i: CommittedInstance<C1>,
     pub u_i: CommittedInstance<C1>,
