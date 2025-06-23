@@ -10,7 +10,7 @@ use ark_crypto_primitives::sponge::{
 };
 use ark_ff::{BigInteger, PrimeField};
 use ark_r1cs_std::R1CSVar;
-use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem, SynthesisMode};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Valid};
 use ark_std::{cmp::max, fmt::Debug, marker::PhantomData, rand::RngCore, One, UniformRand, Zero};
 
@@ -499,7 +499,6 @@ where
         // main circuit R1CS:
         let f_circuit = FC::new(fc_params)?;
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
         let augmented_F_circuit =
             AugmentedFCircuit::<C1, C2, FC>::empty(&poseidon_config, f_circuit.clone());
         augmented_F_circuit.generate_constraints(cs.clone())?;
@@ -509,7 +508,6 @@ where
 
         // CycleFold circuit R1CS
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
-        cs2.set_mode(SynthesisMode::Setup);
         let cf_circuit = NovaCycleFoldCircuit::<C1>::empty();
         cf_circuit.generate_constraints(cs2.clone())?;
         cs2.finalize();
@@ -585,9 +583,7 @@ where
 
         // prepare the circuit to obtain its R1CS
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
-        cs2.set_mode(SynthesisMode::Setup);
 
         let augmented_F_circuit =
             AugmentedFCircuit::<C1, C2, FC>::empty(&pp.poseidon_config, F.clone());
@@ -871,9 +867,7 @@ where
 
         let f_circuit = FC::new(fcircuit_params)?;
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
-        cs.set_mode(SynthesisMode::Setup);
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
-        cs2.set_mode(SynthesisMode::Setup);
         let augmented_F_circuit =
             AugmentedFCircuit::<C1, C2, FC>::empty(&pp.poseidon_config, f_circuit.clone());
         let cf_circuit = NovaCycleFoldCircuit::<C1>::empty();
@@ -1009,7 +1003,6 @@ pub fn get_r1cs_from_cs<F: PrimeField>(
     circuit: impl ConstraintSynthesizer<F>,
 ) -> Result<R1CS<F>, Error> {
     let cs = ConstraintSystem::<F>::new_ref();
-    cs.set_mode(SynthesisMode::Setup);
     circuit.generate_constraints(cs.clone())?;
     cs.finalize();
     let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;

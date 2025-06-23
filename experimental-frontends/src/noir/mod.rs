@@ -85,28 +85,50 @@ impl<F: PrimeField, const SL: usize, const EIL: usize> FCircuit<F> for NoirFCirc
 
         let mut already_assigned_witness_values = HashMap::new();
 
-        self.circuit.public_parameters.0.iter().for_each(|witness| {
-            let idx: usize = witness.as_usize();
-            let witness = AcvmWitness(witness.witness_index());
-            already_assigned_witness_values.insert(witness, &z_i[idx]);
+        self.circuit
+            .public_parameters
+            .0
+            .iter()
+            .map(|witness| {
+                let idx: usize = witness.as_usize();
+                let witness = AcvmWitness(witness.witness_index());
+                already_assigned_witness_values.insert(witness, &z_i[idx]);
+                let val = z_i[idx].value()?;
+                let value = if val == F::zero() {
+                    "0".to_string()
+                } else {
+                    val.to_string()
+                };
 
-            let val = z_i[idx].value().unwrap_or_default();
-
-            let f = GenericFieldElement::<F>::from_repr(val);
-            acvm.overwrite_witness(witness, f);
-        });
+                let f = GenericFieldElement::<F>::try_from_str(&value)
+                    .ok_or(SynthesisError::Unsatisfiable)?;
+                acvm.overwrite_witness(witness, f);
+                Ok(())
+            })
+            .collect::<Result<Vec<()>, SynthesisError>>()?;
 
         // write witness values for external_inputs
-        self.circuit.private_parameters.iter().for_each(|witness| {
-            let idx = witness.as_usize() - z_i.len();
-            let witness = AcvmWitness(witness.witness_index());
-            already_assigned_witness_values.insert(witness, &external_inputs.0[idx]);
+        self.circuit
+            .private_parameters
+            .iter()
+            .map(|witness| {
+                let idx = witness.as_usize() - z_i.len();
+                let witness = AcvmWitness(witness.witness_index());
+                already_assigned_witness_values.insert(witness, &external_inputs.0[idx]);
 
-            let val = external_inputs.0[idx].value().unwrap_or_default();
+                let val = external_inputs.0[idx].value()?;
+                let value = if val == F::zero() {
+                    "0".to_string()
+                } else {
+                    val.to_string()
+                };
 
-            let f = GenericFieldElement::<F>::from_repr(val);
-            acvm.overwrite_witness(witness, f);
-        });
+                let f = GenericFieldElement::<F>::try_from_str(&value)
+                    .ok_or(SynthesisError::Unsatisfiable)?;
+                acvm.overwrite_witness(witness, f);
+                Ok(())
+            })
+            .collect::<Result<Vec<()>, SynthesisError>>()?;
 
         // computes the witness
         let _ = acvm.solve();
