@@ -18,30 +18,31 @@ use self::utils::{compile_source_code, NonameInputs};
 
 // `L` indicates the length of the ExternalInputs vector of field elements.
 #[derive(Debug, Clone)]
-pub struct NonameFCircuit<F: PrimeField, BF: BackendField, const SL: usize, const EIL: usize> {
+pub struct NonameFCircuit<F: PrimeField, BF: BackendField, const L: usize> {
+    pub state_len: usize,
     pub circuit: CompiledCircuit<R1CSNoname<BF>>,
     _f: PhantomData<F>,
 }
 
-impl<F: PrimeField, BF: BackendField, const SL: usize, const EIL: usize> FCircuit<F>
-    for NonameFCircuit<F, BF, SL, EIL>
-{
-    type Params = String;
-    type ExternalInputs = VecF<F, EIL>;
-    type ExternalInputsVar = VecFpVar<F, EIL>;
+impl<F: PrimeField, BF: BackendField, const L: usize> FCircuit<F> for NonameFCircuit<F, BF, L> {
+    type Params = (String, usize);
+    type ExternalInputs = VecF<F, L>;
+    type ExternalInputsVar = VecFpVar<F, L>;
 
-    fn new(code: Self::Params) -> Result<Self, Error> {
+    fn new(params: Self::Params) -> Result<Self, Error> {
+        let (code, state_len) = params;
         let compiled_circuit = compile_source_code::<BF>(&code).map_err(|_| {
             Error::Other("Encountered an error while compiling a noname circuit".to_owned())
         })?;
         Ok(NonameFCircuit {
+            state_len,
             circuit: compiled_circuit,
             _f: PhantomData,
         })
     }
 
     fn state_len(&self) -> usize {
-        SL
+        self.state_len
     }
 
     fn generate_step_constraints(
@@ -122,9 +123,9 @@ mod tests {
     #[test]
     fn test_step_native() -> Result<(), Error> {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        let params = NONAME_CIRCUIT_EXTERNAL_INPUTS.to_owned();
-        // state length = 2, external inputs length = 2
-        let circuit = NonameFCircuit::<Fr, R1csBn254Field, 2, 2>::new(params)?;
+        // state length = 2, external inputs length= 2
+        let params = (NONAME_CIRCUIT_EXTERNAL_INPUTS.to_owned(), 2);
+        let circuit = NonameFCircuit::<Fr, R1csBn254Field, 2>::new(params)?;
         let inputs_public = vec![Fr::from(2), Fr::from(5)];
         let inputs_private = vec![Fr::from(8), Fr::from(2)];
 
@@ -149,9 +150,9 @@ mod tests {
     #[test]
     fn test_step_constraints() -> Result<(), Error> {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        let params = NONAME_CIRCUIT_EXTERNAL_INPUTS.to_owned();
-        // state length = 2, external inputs length = 2
-        let circuit = NonameFCircuit::<Fr, R1csBn254Field, 2, 2>::new(params)?;
+        // external inputs length= 2
+        let params = (NONAME_CIRCUIT_EXTERNAL_INPUTS.to_owned(), 2);
+        let circuit = NonameFCircuit::<Fr, R1csBn254Field, 2>::new(params)?;
         let inputs_public = vec![Fr::from(2), Fr::from(5)];
         let inputs_private = vec![Fr::from(8), Fr::from(2)];
 
@@ -173,13 +174,13 @@ mod tests {
     #[test]
     fn test_generate_constraints_no_external_inputs() -> Result<(), Error> {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        let params = NONAME_CIRCUIT_NO_EXTERNAL_INPUTS.to_owned();
+        let params = (NONAME_CIRCUIT_NO_EXTERNAL_INPUTS.to_owned(), 2); // state length = 2
         let inputs_public = vec![Fr::from(2), Fr::from(5)];
 
         let ivc_inputs_var = Vec::<FpVar<Fr>>::new_witness(cs.clone(), || Ok(inputs_public))?;
 
-        // state length = 2, external inputs length = 0
-        let f_circuit = NonameFCircuit::<Fr, R1csBn254Field, 2, 0>::new(params)?;
+        // external inputs length = 0
+        let f_circuit = NonameFCircuit::<Fr, R1csBn254Field, 0>::new(params)?;
         f_circuit.generate_step_constraints(cs.clone(), 0, ivc_inputs_var, VecFpVar(vec![]))?;
         assert!(cs.is_satisfied()?);
         Ok(())

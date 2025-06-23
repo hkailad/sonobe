@@ -13,33 +13,35 @@ pub mod utils;
 use crate::utils::{VecF, VecFpVar};
 use utils::CircomWrapper;
 
-/// Define CircomFCircuit. The parameter `SL` indicates the length of the state vector.
-/// The parameter `EIL` indicates the length of the ExternalInputs vector of field elements.
+/// Define CircomFCircuit. The parameter `L` indicates the length of the ExternalInputs vector of
+/// field elements.
 #[derive(Clone, Debug)]
-pub struct CircomFCircuit<F: PrimeField, const SL: usize, const EIL: usize> {
+pub struct CircomFCircuit<F: PrimeField, const L: usize> {
     circom_wrapper: CircomWrapper<F>,
+    pub state_len: usize,
     r1cs: CircomR1CS<F>,
 }
 
-impl<F: PrimeField, const SL: usize, const EIL: usize> FCircuit<F> for CircomFCircuit<F, SL, EIL> {
-    /// (r1cs_path, wasm_path)
-    type Params = (PathOrBin, PathOrBin);
-    type ExternalInputs = VecF<F, EIL>;
-    type ExternalInputsVar = VecFpVar<F, EIL>;
+impl<F: PrimeField, const L: usize> FCircuit<F> for CircomFCircuit<F, L> {
+    /// (r1cs_path, wasm_path, state_len)
+    type Params = (PathOrBin, PathOrBin, usize);
+    type ExternalInputs = VecF<F, L>;
+    type ExternalInputsVar = VecFpVar<F, L>;
 
     fn new(params: Self::Params) -> Result<Self, Error> {
-        let (r1cs_path, wasm_path) = params;
+        let (r1cs_path, wasm_path, state_len) = params;
         let circom_wrapper = CircomWrapper::new(r1cs_path, wasm_path)?;
 
         let r1cs = circom_wrapper.extract_r1cs()?;
         Ok(Self {
             circom_wrapper,
+            state_len,
             r1cs,
         })
     }
 
     fn state_len(&self) -> usize {
-        SL
+        self.state_len
     }
 
     fn generate_step_constraints(
@@ -50,14 +52,14 @@ impl<F: PrimeField, const SL: usize, const EIL: usize> FCircuit<F> for CircomFCi
         external_inputs: Self::ExternalInputsVar,
     ) -> Result<Vec<FpVar<F>>, SynthesisError> {
         #[cfg(test)]
-        assert_eq!(z_i.len(), SL);
+        assert_eq!(z_i.len(), self.state_len());
         #[cfg(test)]
-        assert_eq!(external_inputs.0.len(), EIL);
+        assert_eq!(external_inputs.0.len(), L);
 
         let input_values = self.fpvars_to_bigints(&z_i)?;
         let mut inputs_map = vec![("ivc_input".to_string(), input_values)];
 
-        if EIL > 0 {
+        if L > 0 {
             let external_inputs_bi = self.fpvars_to_bigints(&external_inputs.0)?;
             inputs_map.push(("external_inputs".to_string(), external_inputs_bi));
         }
@@ -95,14 +97,15 @@ impl<F: PrimeField, const SL: usize, const EIL: usize> FCircuit<F> for CircomFCi
         // }
 
         // Extracts the z_i1(next state) from the witness vector.
-        let z_i1: Vec<FpVar<F>> =
-            Vec::<FpVar<F>>::new_witness(cs.clone(), || Ok(witness[1..1 + SL].to_vec()))?;
+        let z_i1: Vec<FpVar<F>> = Vec::<FpVar<F>>::new_witness(cs.clone(), || {
+            Ok(witness[1..1 + self.state_len()].to_vec())
+        })?;
 
         Ok(z_i1)
     }
 }
 
-impl<F: PrimeField, const SL: usize, const EIL: usize> CircomFCircuit<F, SL, EIL> {
+impl<F: PrimeField, const L: usize> CircomFCircuit<F, L> {
     fn fpvars_to_bigints(&self, fpvars: &[FpVar<F>]) -> Result<Vec<BigInt>, SynthesisError> {
         let mut input_values = Vec::new();
         // converts each FpVar to PrimeField value, then to num_bigint::BigInt.
@@ -167,7 +170,7 @@ pub mod tests {
             PathBuf::from("./src/circom/test_folder/cubic_circuit_js/cubic_circuit.wasm");
 
         let circom_fcircuit =
-            CircomFCircuit::<Fr, 1, 0>::new((r1cs_path.into(), wasm_path.into()))?; // state_len:1, external_inputs_len:0
+            CircomFCircuit::<Fr, 0>::new((r1cs_path.into(), wasm_path.into(), 1))?; // state_len:1, external_inputs_len:0
 
         let cs = ConstraintSystem::<Fr>::new_ref();
 
@@ -188,7 +191,7 @@ pub mod tests {
             PathBuf::from("./src/circom/test_folder/cubic_circuit_js/cubic_circuit.wasm");
 
         let circom_fcircuit =
-            CircomFCircuit::<Fr, 1, 0>::new((r1cs_path.into(), wasm_path.into()))?; // state_len:1, external_inputs_len:0
+            CircomFCircuit::<Fr, 0>::new((r1cs_path.into(), wasm_path.into(), 1))?; // state_len:1, external_inputs_len:0
 
         // Allocates z_i1 by using step_native function.
         let z_i = vec![Fr::from(3_u32)];
@@ -212,7 +215,7 @@ pub mod tests {
             "./src/circom/test_folder/with_external_inputs_js/with_external_inputs.wasm",
         );
         let circom_fcircuit =
-            CircomFCircuit::<Fr, 1, 2>::new((r1cs_path.into(), wasm_path.into()))?; // state_len:1, external_inputs_len:2
+            CircomFCircuit::<Fr, 2>::new((r1cs_path.into(), wasm_path.into(), 1))?; // state_len:1, external_inputs_len:2
         let cs = ConstraintSystem::<Fr>::new_ref();
         let z_i = vec![Fr::from(3u32)];
         let external_inputs = vec![Fr::from(6u32), Fr::from(7u32)];
@@ -257,7 +260,7 @@ pub mod tests {
         let wasm_path =
             PathBuf::from("./src/circom/test_folder/no_external_inputs_js/no_external_inputs.wasm");
         let circom_fcircuit =
-            CircomFCircuit::<Fr, 3, 0>::new((r1cs_path.into(), wasm_path.into()))?;
+            CircomFCircuit::<Fr, 0>::new((r1cs_path.into(), wasm_path.into(), 3))?;
         let cs = ConstraintSystem::<Fr>::new_ref();
         let z_i = vec![Fr::from(3u32), Fr::from(4u32), Fr::from(5u32)];
         let z_i_var = Vec::<FpVar<Fr>>::new_witness(cs.clone(), || Ok(z_i.clone()))?;
@@ -294,7 +297,7 @@ pub mod tests {
             PathBuf::from("./src/circom/test_folder/cubic_circuit_js/cubic_circuit.wasm");
 
         let circom_fcircuit =
-            CircomFCircuit::<Fr, 1, 0>::new((r1cs_path.into(), wasm_path.into()))?; // state_len:1, external_inputs_len:0
+            CircomFCircuit::<Fr, 0>::new((r1cs_path.into(), wasm_path.into(), 1))?; // state_len:1, external_inputs_len:0
 
         // Allocates z_i1 by using step_native function.
         let z_i = vec![Fr::from(3_u32)];
